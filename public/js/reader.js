@@ -193,6 +193,8 @@ export function mountReader(root, photoId, query, options = {}) {
     rawBytes: 0,
     dims: new Map(),     // idx -> {width, height}
     destroyed: false,
+    // null 表示能力尚未从 /api/config 确认；确认失败时按关闭处理。
+    translationAvailable: offline ? false : null,
   };
 
   const decodeQueue = new Map(); // idx -> 进行中的解码 Promise（并发去重 + 复用）
@@ -882,6 +884,10 @@ export function mountReader(root, photoId, query, options = {}) {
     const albumPromise = state.aid
       ? readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null)
       : Promise.resolve(null);
+    // 与章节/详情并行读取能力配置；翻译关闭时阅读器不应逐页发送 503 探测请求。
+    const translationConfigPromise = fetch('/api/config', {
+      credentials: 'same-origin', signal,
+    }).then((res) => (res.ok ? res.json() : null)).catch(() => null);
     let data;
     const requestedShunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
     try {
@@ -902,6 +908,19 @@ export function mountReader(root, photoId, query, options = {}) {
     state.scrambleId = d.scrambleId || 0;
     state.speed = d.speed || '';
     activeImageShunt = requestedShunt;
+
+    // 配置是本机请求，正常应在毫秒级完成；设置上限避免异常时再次阻塞首图。
+    const config = await Promise.race([
+      translationConfigPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+    ]);
+    if (state.destroyed || signal.aborted) return;
+    state.translationAvailable = config?.translation?.available === true;
+
+    // 章节图片已就绪时立即挂载首屏；详情只负责标题、封面和章节抽屉，后台补齐。
+    container.querySelector('.r-loading')?.remove();
+    titleEl.textContent = `章节 ${state.photoId}`;
+    render();
 
     const album = await albumPromise;
     if (state.destroyed) return;
@@ -934,7 +953,6 @@ export function mountReader(root, photoId, query, options = {}) {
       renderDrawer();
     }
 
-    container.querySelector('.r-loading')?.remove();
     titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
     render();
   }
@@ -1104,37 +1122,16 @@ export function mountReader(root, photoId, query, options = {}) {
       blob = stored?.blob;
       if (!(blob instanceof Blob) || !blob.size) throw new Error(`离线图片 ${idx + 1} 缺失或损坏`);
     } else {
-      // 图片线路偶发超时/5xx 时自动短退避重试，避免连续滚动在单页失败后
-      // 必须手动点击“重试”。仅重试网络错误和 5xx，4xx 仍立即报告。
-      let res = null;
-      let lastError = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        assertImageActive(generation, imageSignal);
-        try {
-          res = await fetch(srcOf(idx), {
-            headers: { 'X-JMW-Data-Source': selectedDataSource() },
-            credentials: 'same-origin',
-            // Chromium 会据此让当前可见页优先于预加载邻页；不支持该字段的
-            // 浏览器会安全忽略它。
-            priority: idx === state.cur ? 'high' : 'low',
-            signal: imageSignal,
-          });
-          if (res.ok || (res.status >= 400 && res.status < 500)) break;
-          lastError = new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
-          try { res.body?.cancel(); } catch (_) {}
-        } catch (error) {
-          if (error?.name === 'AbortError' || imageSignal.aborted) throw error;
-          lastError = error;
-        }
-        if (attempt < 2) await new Promise((resolve, reject) => {
-          const timer = setTimeout(done, 250 * (attempt + 1));
-          const onAbort = () => { clearTimeout(timer); imageSignal.removeEventListener('abort', onAbort); reject(abortError()); };
-          const done = () => { imageSignal.removeEventListener('abort', onAbort); resolve(); };
-          imageSignal.addEventListener('abort', onAbort, { once: true });
-        });
-      }
-      if (!res) throw lastError || new Error(`图片 ${idx + 1} 获取失败`);
-      if (!res.ok) throw lastError || new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
+      // 服务端图片代理已经负责线路熔断和故障切换；浏览器不再重复触发
+      // 整个多域名遍历，避免一次坏线路把等待时间放大到几十秒。
+      assertImageActive(generation, imageSignal);
+      const res = await fetch(srcOf(idx), {
+        headers: { 'X-JMW-Data-Source': selectedDataSource() },
+        credentials: 'same-origin',
+        priority: idx === state.cur ? 'high' : 'low',
+        signal: imageSignal,
+      });
+      if (!res.ok) throw new Error(`图片 ${idx + 1} 获取失败（${res.status}）`);
       const responseMime = String(res.headers?.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
       if (!SAFE_IMAGE_MIME.has(responseMime)) {
         throw new Error(`图片 ${idx + 1} 返回了不支持的内容类型`);
@@ -1155,6 +1152,7 @@ export function mountReader(root, photoId, query, options = {}) {
    */
   async function translatePageBlob(blob, idx, generation, sourceVersion, imageSignal) {
     if (!(blob instanceof Blob) || !blob.size) return null;
+    if (state.translationAvailable !== true) return null;
     const query = new URLSearchParams({
       aid: String(state.aid || ''),
       photoId: String(state.photoId || ''),

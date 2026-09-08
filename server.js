@@ -307,6 +307,41 @@ function sendJson(res, status, obj, extraHeaders = {}) {
   res.end(body);
 }
 
+// 公共漫画数据在短时间内对所有访客一致。进程内 TTL + single-flight 可避免
+// 首页刷新、多个标签页同时打开时重复打满上游线路；用户态接口不使用此缓存。
+const publicApiCache = new Map();
+const publicApiFlights = new Map();
+const PUBLIC_API_CACHE_LIMIT = 256;
+
+async function cachedPublicApi(key, ttlMs, loader) {
+  const cacheKey = String(key || '');
+  const now = Date.now();
+  const hit = publicApiCache.get(cacheKey);
+  if (hit && hit.expiresAt > now) {
+    publicApiCache.delete(cacheKey);
+    publicApiCache.set(cacheKey, hit);
+    return hit.value;
+  }
+  if (hit) publicApiCache.delete(cacheKey);
+  const running = publicApiFlights.get(cacheKey);
+  if (running) return running;
+  const flight = Promise.resolve().then(loader).then((value) => {
+    publicApiCache.set(cacheKey, { value, expiresAt: Date.now() + Math.max(1000, ttlMs) });
+    while (publicApiCache.size > PUBLIC_API_CACHE_LIMIT) {
+      publicApiCache.delete(publicApiCache.keys().next().value);
+    }
+    return value;
+  }).finally(() => {
+    if (publicApiFlights.get(cacheKey) === flight) publicApiFlights.delete(cacheKey);
+  });
+  publicApiFlights.set(cacheKey, flight);
+  return flight;
+}
+
+function publicApiKey(route, dataSource, query = {}) {
+  return `${route}:${dataSource}:${JSON.stringify(query)}`;
+}
+
 // 收藏夹/历史可能在本地分组或隐藏记录过滤后变成空页，前端仍需要知道
 // 上游是否重复返回了同一页。只发送稳定指纹，不把未展示的条目内容额外
 // 暴露给浏览器；优先使用 JM 号，异常条目才退化到少量展示字段。
@@ -1260,6 +1295,8 @@ const IMAGE_HOST_FAILURE_BASE_MS = 5000;
 const IMAGE_HOST_FAILURE_MAX_MS = 2 * 60 * 1000;
 const IMAGE_HOST_HEALTH_LIMIT = 200;
 const imageHostHealth = new Map();
+// 跨请求记录线路质量，优先选择近期低延迟且成功率高的图片域名。
+const imageHostStats = new Map();
 const TRANSIENT_IMAGE_FAILURES = new Set([
   'dns', 'connect', 'tls', 'timeout', 'network', 'http_retryable', 'http_429', 'http_5xx',
 ]);
@@ -1346,6 +1383,52 @@ function releaseImageHostProbe(host) {
 
 function clearImageHostHealth() {
   imageHostHealth.clear();
+  imageHostStats.clear();
+}
+
+function noteImageHostResult(host, durationMs, success) {
+  const normalized = normalizedImageHost(host);
+  if (!normalized) return;
+  const previous = imageHostStats.get(normalized) || { latency: 1000, failures: 0, samples: 0 };
+  const duration = Math.max(1, Math.min(30_000, Number(durationMs) || 1));
+  const samples = Math.min(100, previous.samples + 1);
+  const latency = previous.samples ? previous.latency * 0.7 + duration * 0.3 : duration;
+  const failures = Math.max(0, Math.min(1, previous.failures * 0.7 + (success ? 0 : 1) * 0.3));
+  imageHostStats.delete(normalized);
+  imageHostStats.set(normalized, { latency, failures, samples });
+  while (imageHostStats.size > IMAGE_HOST_HEALTH_LIMIT) {
+    imageHostStats.delete(imageHostStats.keys().next().value);
+  }
+}
+
+function imageHostScore(host) {
+  const stat = imageHostStats.get(normalizedImageHost(host));
+  if (!stat || stat.samples < 2) return null;
+  // 失败率比少量延迟差异更重要，避免继续把请求送往不稳定线路。
+  return stat.latency * (1 + stat.failures * 8);
+}
+
+function orderImageHosts(hosts) {
+  const list = Array.isArray(hosts) ? hosts.slice() : [];
+  return list.map((host, index) => ({ host, index, score: imageHostScore(host) }))
+    .sort((a, b) => {
+      if (a.score === null && b.score === null) return a.index - b.index;
+      if (a.score === null) return 1;
+      if (b.score === null) return -1;
+      return a.score - b.score || a.index - b.index;
+    }).map((row) => row.host);
+}
+
+function orderImageCandidates(candidates) {
+  const list = Array.isArray(candidates) ? candidates.slice() : [];
+  return list.map((target, index) => ({
+    target, index, score: imageHostScore(target && target.origin),
+  })).sort((a, b) => {
+    if (a.score === null && b.score === null) return a.index - b.index;
+    if (a.score === null) return 1;
+    if (b.score === null) return -1;
+    return a.score - b.score || a.index - b.index;
+  }).map((row) => row.target);
 }
 
 function reserveImageHost(host, now = Date.now()) {
@@ -1388,7 +1471,7 @@ function imageUrlCandidates(value) {
     const candidate = new URL(`${original.pathname}${original.search}`, host);
     candidates.push(validateImageUrl(candidate));
   }
-  return candidates;
+  return orderImageCandidates(candidates);
 }
 
 async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
@@ -1431,6 +1514,7 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
       attempts++;
       noteImageAttempt(trace, attempts);
       setImageTraceHost(trace, target);
+      const attemptStarted = Date.now();
       let fetched;
       let hostHealthy = false;
       try {
@@ -1475,6 +1559,7 @@ async function proxyImage(res, urlStr, cacheDays = 7, clientSignal) {
         markImageHostHealthy(host);
         return sendJson(res, lastStatus, { error: publicErrorMessage(error, '图片获取失败') });
       } finally {
+        noteImageHostResult(host, Date.now() - attemptStarted, hostHealthy);
         if (fetched) fetched.cleanup();
         if (!hostHealthy) releaseImageHostProbe(host);
       }
@@ -1518,7 +1603,7 @@ async function proxyImagePath(res, p, clientSignal) {
     }
   }
   try {
-    const hosts = settings.imageHosts();
+    const hosts = orderImageHosts(settings.imageHosts());
     const trace = imageTrace(res);
     const now = Date.now();
     const deadline = now + IMAGE_PATH_TOTAL_TIMEOUT;
@@ -1537,6 +1622,7 @@ async function proxyImagePath(res, p, clientSignal) {
       attempts++;
       noteImageAttempt(trace, attempts);
       setImageTraceHost(trace, host);
+      const attemptStarted = Date.now();
       let fetched;
       let hostHealthy = false;
       try {
@@ -1583,6 +1669,7 @@ async function proxyImagePath(res, p, clientSignal) {
         else markImageHostHealthy(host);
         /* 尝试下一个域名 */
       } finally {
+        noteImageHostResult(host, Date.now() - attemptStarted, hostHealthy);
         if (fetched) fetched.cleanup();
         if (!hostHealthy) releaseImageHostProbe(host);
       }
@@ -1832,6 +1919,8 @@ async function api(req, res, u, requestSignal) {
           mixed: { available: settings.apiHostsForSource('mixed', jar.apiHost).length > 0, hosts: settings.apiHostsForSource('mixed', jar.apiHost).length },
         },
         imageHosts: settings.imageHosts(),
+        // 阅读器在翻译关闭时应完全跳过逐页翻译请求，避免用 503 探测能力。
+        translation: { available: !!TRANSLATION_SERVICE_URL },
         hasAccessPassword: !!ACCESS_PASSWORD,
         advanced: {
           ai: features.aiConfig(),
@@ -1940,13 +2029,19 @@ async function api(req, res, u, requestSignal) {
 
     /* ---- 漫画 ---- */
     case '/home':
-      return sendJson(res, 200, await call({ path: '/promote' }));
+      return sendJson(res, 200, await cachedPublicApi(
+        publicApiKey('/home', dataSource), 30_000,
+        () => call({ path: '/promote', signal: null }),
+      ));
 
     case '/promote_list':
-      return sendJson(res, 200, await call({ path: '/promote_list', query: {
-        id: q.get('id') || '',
-        page: q.get('page') || '1',
-      } }));
+      {
+        const query = { id: q.get('id') || '', page: q.get('page') || '1' };
+        return sendJson(res, 200, await cachedPublicApi(
+          publicApiKey('/promote_list', dataSource, query), 30_000,
+          () => call({ path: '/promote_list', query, signal: null }),
+        ));
+      }
 
     case '/album': {
       const out = await call({ path: '/album', query: { id: q.get('id') } });
@@ -1977,31 +2072,55 @@ async function api(req, res, u, requestSignal) {
     }
 
     case '/search':
-      return sendJson(res, 200, await call({ path: '/search', query: {
-        page: q.get('page') || '1',
-        o: q.get('o') || 'mr',
-        search_query: q.get('q') || '',
-      } }));
+      {
+        const query = {
+          page: q.get('page') || '1',
+          o: q.get('o') || 'mr',
+          search_query: q.get('q') || '',
+        };
+        return sendJson(res, 200, await cachedPublicApi(
+          publicApiKey('/search', dataSource, query), 30_000,
+          () => call({ path: '/search', query, signal: null }),
+        ));
+      }
 
     case '/categories':
-      return sendJson(res, 200, await call({ path: '/categories' }));
+      return sendJson(res, 200, await cachedPublicApi(
+        publicApiKey('/categories', dataSource), 300_000,
+        () => call({ path: '/categories', signal: null }),
+      ));
 
     case '/categories_filter':
-      return sendJson(res, 200, await call({ path: '/categories/filter', query: {
-        page: q.get('page') || '1',
-        c: q.get('c') || '',
-        o: q.get('o') || 'mr',
-      } }));
+      {
+        const query = {
+          page: q.get('page') || '1',
+          c: q.get('c') || '',
+          o: q.get('o') || 'mr',
+        };
+        return sendJson(res, 200, await cachedPublicApi(
+          publicApiKey('/categories_filter', dataSource, query), 30_000,
+          () => call({ path: '/categories/filter', query, signal: null }),
+        ));
+      }
 
     case '/week':
-      return sendJson(res, 200, await call({ path: '/week' }));
+      return sendJson(res, 200, await cachedPublicApi(
+        publicApiKey('/week', dataSource), 60_000,
+        () => call({ path: '/week', signal: null }),
+      ));
 
     case '/week_filter':
-      return sendJson(res, 200, await call({ path: '/week/filter', query: {
-        page: q.get('page') || '1',
-        id: q.get('id') || '',
-        type: q.get('type') || '',
-      } }));
+      {
+        const query = {
+          page: q.get('page') || '1',
+          id: q.get('id') || '',
+          type: q.get('type') || '',
+        };
+        return sendJson(res, 200, await cachedPublicApi(
+          publicApiKey('/week_filter', dataSource, query), 60_000,
+          () => call({ path: '/week/filter', query, signal: null }),
+        ));
+      }
 
     case '/comments':
       return sendJson(res, 200, await call({ path: '/forum', query: {
