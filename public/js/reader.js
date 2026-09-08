@@ -1267,7 +1267,12 @@ export function mountReader(root, photoId, query, options = {}) {
         displayUrl = URL.createObjectURL(displayBlob);
       }
       const url = displayUrl;
-      const rec = { url, generation, sourceVersion };
+      const dims = state.dims.get(idx);
+      const rec = {
+        url, generation, sourceVersion,
+        width: dims?.width,
+        height: dims?.height,
+      };
       retireDecoded(state.decoded.get(idx));
       state.decoded.set(idx, rec);
       // 原图不为获取尺寸而预先完整解码；由最终挂载的 <img> 在 onload 后回填。
@@ -1394,8 +1399,13 @@ export function mountReader(root, photoId, query, options = {}) {
     slot.dataset.mounted = '1';
     slot.dataset.generation = String(rec.generation);
     slot.dataset.objectUrl = rec.url;
+    const knownWidth = Number(rec.width || state.dims.get(idx)?.width);
+    const knownHeight = Number(rec.height || state.dims.get(idx)?.height);
     const image = h('img', {
       src: rec.url, alt: `第${idx + 1}页`, draggable: 'false',
+      ...(Number.isFinite(knownWidth) && knownWidth > 0 && Number.isFinite(knownHeight) && knownHeight > 0
+        ? { width: String(knownWidth), height: String(knownHeight) }
+        : {}),
       onload: () => {
         const beforeResize = captureScrollAnchor();
         backfillReaderImageDimensions({
