@@ -411,6 +411,9 @@ body.reading #main { padding: 0; }
 #reader.toolbar-on .r-progress { opacity: 1; }
 #reader .pages {
   height: 100%; overflow-y: auto; overscroll-behavior: contain;
+  /* 图片完成解码时由 reader.js 按可见槽位恢复滚动锚点；关闭浏览器自身
+     的二次滚动锚定，避免两套补偿叠加造成向下跳动。 */
+  overflow-anchor: none;
   scrollbar-color: #3b3d46 #111217; scrollbar-width: thin;
   -webkit-overflow-scrolling: touch;
 }

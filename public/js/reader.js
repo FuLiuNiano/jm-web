@@ -1352,7 +1352,14 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function captureScrollAnchor() {
     if (state.mode !== 'scroll' || !pages.isConnected) return null;
-    const anchor = pages.querySelector(`.slot[data-idx="${state.cur}"]`) || pages.querySelector('.slot');
+    const pageRect = pages.getBoundingClientRect();
+    const slots = [...pages.querySelectorAll('.slot[data-idx]')];
+    // 以实际进入视口的第一张图作为锚点，而不是依赖 scroll handler
+    // 异步更新的 state.cur；这样邻页加载时也能稳定保持用户当前视线。
+    const anchor = slots.find((slot) => {
+      const rect = slot.getBoundingClientRect();
+      return rect.bottom > pageRect.top + 1 && rect.top < pageRect.bottom;
+    }) || slots[0];
     if (!anchor) return null;
     return { anchor, top: anchor.getBoundingClientRect().top };
   }
