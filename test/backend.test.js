@@ -329,15 +329,15 @@ class MockServerResponse extends EventEmitter {
     assert.strictEqual(typeof reusableImageSlot, 'function');
     reusableImageSlot();
 
-    // 封面缓存只接收安全的 albums/library/album/novels 路径；章节 photos
-    // 不进入缓存，且缓存响应应带长度和命中标记。
+    // 图片缓存只接收安全的媒体路径；章节 photos 也进入有界缓存，便于回看
+    // 和多标签页复用，缓存响应应带长度和命中标记。
     clearImageCache();
     assert.match(imageCacheKeyForPath('/media/albums/123_3x4.jpg'), /^path:/);
     assert.match(imageCacheKeyForPath('/media/library/album/x/thumb/album.jpg'), /^path:/);
-    assert.strictEqual(imageCacheKeyForPath('/media/photos/123/00001.jpg'), '');
+    assert.match(imageCacheKeyForPath('/media/photos/123/00001.jpg'), /^path:/);
     assert.strictEqual(imageCacheKeyForPath('/media/albums/../photos/00001.jpg'), '');
     assert.strictEqual(imageCacheKeyForPath('/media/albums/%2e%2e/photos/00001.jpg'), '');
-    assert.strictEqual(imageCacheKeyForUrl('https://cdn.example/media/photos/1.jpg'), '');
+    assert.match(imageCacheKeyForUrl(`${settings.imageHosts()[0]}/media/photos/1.jpg`), /^url:/);
     const cacheKey = imageCacheKeyForPath('/media/albums/cache-test.jpg');
     const trustedImageHost = settings.imageHosts()[0];
     assert.strictEqual(cacheKeyForFetchedImage(cacheKey, `${trustedImageHost}/media/albums/cache-test.jpg`), cacheKey);
@@ -1086,6 +1086,7 @@ class MockServerResponse extends EventEmitter {
     }
     assert.ok(!JSON.stringify(imageLog).includes(imageQueryMarker), '图片日志不得记录签名查询参数');
 
+    clearImageCache();
     absoluteCalls = [];
     response = await originalFetch(`http://127.0.0.1:${port}/api/img?u=${encodeURIComponent(absoluteUrl)}`);
     assert.strictEqual(response.status, 200);
@@ -1096,6 +1097,7 @@ class MockServerResponse extends EventEmitter {
     // 404 是资源语义，不得开启整个域名的熔断，也不得对可能绑定 origin 的
     // 签名 URL 盲目换线。
     clearImageHostHealth();
+    clearImageCache();
     let notFoundCalls = 0;
     global.fetch = async () => {
       notFoundCalls++;

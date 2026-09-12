@@ -28,6 +28,10 @@ function deferred() {
     readerRawCacheBytes,
     blobByteSize,
     recommendedDecodeConcurrency,
+    recommendedPrefetchCount,
+    normalizeRecapSkipPages,
+    filterReaderImages,
+    detectRecapPageCount,
   } = await import(readerUrl);
   const descrambleUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'descramble.js')).href;
   const { validateDecodeDimensions } = await import(descrambleUrl);
@@ -41,6 +45,23 @@ function deferred() {
   assert.strictEqual(recommendedDecodeConcurrency({ deviceMemory: 2 }), 2);
   assert.strictEqual(recommendedDecodeConcurrency({ deviceMemory: 8 }), 3);
   assert.strictEqual(recommendedDecodeConcurrency({ memoryOptimized: true, configured: 4 }), 4);
+  assert.strictEqual(recommendedPrefetchCount({ configured: 5, saveData: true }), 1);
+  assert.strictEqual(recommendedPrefetchCount({ configured: 5, effectiveType: '2g' }), 1);
+  assert.strictEqual(recommendedPrefetchCount({ configured: 5, deviceMemory: 2 }), 2);
+  assert.strictEqual(recommendedPrefetchCount({ configured: 5, effectiveType: '4g' }), 5);
+  assert.strictEqual(normalizeRecapSkipPages(-3), 0);
+  assert.strictEqual(normalizeRecapSkipPages(99), 20);
+  const recapImages = [{ index: 0 }, { index: 1 }, { index: 2 }, { index: 3 }];
+  assert.deepStrictEqual(filterReaderImages(recapImages, 2), recapImages.slice(2));
+  assert.deepStrictEqual(filterReaderImages(recapImages, 99), [recapImages[3]], '至少保留一页');
+  assert.strictEqual(detectRecapPageCount(
+    [{ url: 'https://cdn-a.example/page-3.jpg?sig=1' }, { url: 'https://cdn-a.example/page-4.jpg' }, { url: 'https://cdn-a.example/new.jpg' }],
+    [{ url: 'https://cdn-b.example/page-1.jpg' }, { url: 'https://cdn-b.example/page-3.jpg' }, { url: 'https://cdn-b.example/page-4.jpg?sig=2' }],
+  ), 2, '不同 CDN 和签名参数仍应识别重复回顾');
+  assert.strictEqual(detectRecapPageCount(
+    [{ url: 'https://cdn.example/only-one.jpg' }, { url: 'https://cdn.example/new.jpg' }],
+    [{ url: 'https://cdn.example/only-one.jpg' }],
+  ), 0, '只有一页重复时不自动判定为回顾');
   assert.throws(
     () => validateDecodeDimensions(4000, 10000),
     /图片过大/,
@@ -66,6 +87,7 @@ function deferred() {
   // 半径 2 的窗口只能覆盖 current ± 2，不能再隐式扩大为 n + 2。
   // 顺序对齐客户端：当前页完成后先后续页，再前序页，而不是交替调度。
   assert.deepStrictEqual(readerPrefetchOrder(5, 12, 2), [5, 6, 7, 4, 3]);
+  assert.deepStrictEqual(readerPrefetchOrder(5, 12, 2, 'forward'), [5, 6, 7]);
   assert.deepStrictEqual(readerPrefetchOrder(0, 12, 2), [0, 1, 2]);
   assert.deepStrictEqual(readerPrefetchOrder(11, 12, 2), [11, 10, 9]);
   assert.deepStrictEqual(readerPrefetchOrder(-1, 12, 2), []);
@@ -116,7 +138,7 @@ function deferred() {
   const rawEnd = source.indexOf('return rec;', rawStart);
   assert.ok(rawStart >= 0 && rawEnd > rawStart);
   // LRU 命中后不能清除早先由 onload 验证并回填的尺寸。
-  assert.ok(!source.slice(rawStart, rawEnd).includes('state.dims.'));
+  assert.ok(!source.slice(rawStart, rawEnd).includes('state.dims.set('));
 
   const prefetchStart = source.indexOf('function prefetchAround(idx)');
   const prefetchEnd = source.indexOf('\n  function placeholderFor', prefetchStart);

@@ -14,7 +14,7 @@
 - **搜索**：关键词、作者、标签或 JM 编号；四种排序、无限滚动、搜索历史、`-标签` 排除语法和可复用排除模板。
 - **漫画详情与社交**：封面、标签、简介、章节、相关漫画、复制 JM 号、点赞、收藏；评论、嵌套回复、点赞和发表评论。
 - **账号数据**：登录/自动登录、签到日历、收藏列表及浏览器本地收藏夹（新建、改名、删除、批量移动）、云端阅读历史、评论历史。
-- **完整阅读器**：连续滚动、正序/RTL 单页、点击翻页四种模式；前后预解码、章节跳转、进度恢复、页码、亮度、Wake Lock、1–4x 缩放、工具栏自动隐藏、点击区域、内存优化和解码并发设置；阅读中可热切换主题、图片线路和预加载，并提供一次性操作引导。
+- **完整阅读器**：连续滚动、正序/RTL 单页、点击翻页四种模式；前后预解码、章节跳转、进度恢复、页码、亮度、Wake Lock、1–4x 缩放、工具栏自动隐藏、点击区域、内存优化和解码并发设置；阅读中可热切换主题、图片线路和预加载，并自动识别上一话回顾，也可手动跳过指定页数。
 - **图片还原**：使用与安卓客户端相同的扰乱规则在浏览器模块 Worker + OffscreenCanvas 解码；不支持时自动回退主线程 Canvas，下载时保存解扰后的图片。
 - **下载与离线**：IndexedDB 离线资料库、可批量暂停/继续/重试/移除的持久下载队列、断点补页、完整性检查、存储统计/清理和离线阅读；恢复备份时可按原整本/选章意图重建下载任务。
 - **导出与 PWA**：整本/单章 ZIP、浏览器打印为 PDF、Service Worker、Web App Manifest 和可安装 PWA 外壳。
@@ -35,13 +35,29 @@
 
 ## 部署
 
+### 上传到 GitHub 前
+
+`.gitignore` 已排除 `.env`、`data/`、`node_modules/` 和日志。上传前仍建议在本地检查暂存内容：
+
+```bash
+git status
+git diff --check
+git add .
+git diff --cached --name-only
+git commit -m "feat: improve reader loading and recap detection"
+git push origin main
+```
+
+确认暂存列表中没有 `.env`、`data/`、Cookie、API Key 或其他运行时凭据；如果这是新仓库，把 `origin` 换成你自己的 GitHub 仓库地址。不要把生产服务器的 `data/` 目录复制进 GitHub。
+
 ### 方式一：直接运行（推荐）
 
-服务器需有 Node.js **20.0.0 或更高**版本（零运行时依赖，无需 `npm install`）。生产环境建议使用仍在安全维护期内的 LTS 版本；项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
+服务器需有 Node.js **20.0.0 或更高**版本。直接运行需要安装锁定的运行依赖（当前包含 `sharp`）；生产环境建议使用仍在安全维护期内的 LTS 版本。项目 Docker 构建基线固定为 `node:22.23.2-alpine3.24`，升级需经过显式评审与回归：
 
 ```bash
 git clone <本项目目录> jm-web   # 或直接上传 jm-web 文件夹
 cd jm-web
+npm ci --omit=dev
 node server.js                 # 默认仅监听 127.0.0.1:3210
 ```
 
@@ -87,6 +103,7 @@ chmod 700 data
 
 ```powershell
 cd jm-web
+npm ci --omit=dev
 Copy-Item .env.example .env    # Windows PowerShell
 New-Item -ItemType Directory -Force data | Out-Null
 ```
@@ -106,11 +123,11 @@ Compose 默认只将 `127.0.0.1:3210` 发布到宿主机，适合同机 Nginx/Ca
 
 单实例默认限制为 `1.0` CPU、`512m` 内存和 `256` 个进程，Docker `json-file` 日志按 `10m × 3` 轮转；图片代理默认最多同时处理 `12` 个请求，单个客户端最多 `6` 个，另有 `96` 个等待队列（单请求最多等待 3 秒）。可通过 `.env` 中的 `JMW_CPU_LIMIT`、`JMW_MEMORY_LIMIT`、`JMW_PIDS_LIMIT`、`JMW_LOG_MAX_SIZE`、`JMW_LOG_MAX_FILE`、`JMW_MAX_IMAGE_CONCURRENCY`、`JMW_MAX_IMAGE_CONCURRENCY_PER_IP`、`JMW_IMAGE_QUEUE_LIMIT`、`JMW_IMAGE_QUEUE_TIMEOUT` 调整。调整前应基于容量测试确定水位，不能直接删除上限。
 
-图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面/缩略图会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），章节正文仍保持流式转发，重启后缓存自动清空。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
+图片代理只做白名单校验、并发控制和流式转发，不在服务端把整章下载到内存或执行解扰；封面、缩略图和不超过单项上限的正文图片会进入有界的进程内 LRU 缓存（默认总计 64 MiB、单张 2 MiB、保存 24 小时），重启后缓存自动清空。响应带有反向代理友好的流式标记，避免 Nginx 缓冲首图。阅读器默认按顺序持续预缓存后续页面，也可在阅读设置中关闭；该功能每次只处理一页，遇到上游失败会暂停，避免后台任务抢占当前阅读。上游暂时超时或 5xx 时，前端会以退避方式有限重试，后端也会短暂跳过故障线路。解扰在浏览器中进行。支持的浏览器会把解扰放入模块 Worker/OffscreenCanvas，减少阅读器主线程卡顿；旧 Safari/WebView 自动回退主线程 Canvas。阅读器会按设备内存以字节预算回收原图缓存，并在创建 Canvas 前拒绝超大或单轴过长的条漫图片。公网部署仍建议保持访问口令、反向代理和单实例资源上限，不要把它当作多人共享的无认证图片代理。
 
 #### 漫画翻译服务（随主服务统一管理）
 
-翻译服务仍是独立的 Python 容器，但已经纳入主项目 Compose。阅读器会在当前页挂载前最多等待约 1.5 秒，邻页按预取顺序处理，超时则直接显示原图，不会在用户看过后迟到替换。首次部署只需：
+翻译服务仍是独立的 Python 容器，但已经纳入主项目 Compose。为优先保证漫画加载速度，阅读器默认关闭逐页翻译；需要时可在阅读设置 → 性能中打开“启用漫画翻译”。打开后会增加首图等待和服务器 CPU 占用。首次部署只需：
 
 ```bash
 cp .env.example .env
@@ -207,9 +224,9 @@ docker compose --env-file .env \
 | `JMW_MAX_IMAGE_BYTES` | `26214400` | 图片代理单文件大小上限（字节，范围 1–100 MiB） |
 | `JMW_MAX_IMAGE_CONCURRENCY` | `12` | 图片代理全局最大并发数（范围 1–100） |
 | `JMW_MAX_IMAGE_CONCURRENCY_PER_IP` | `6` | 单客户端图片代理最大并发数（范围 1–全局上限） |
-| `JMW_IMAGE_CACHE_BYTES` | `67108864` | 封面进程内缓存总上限（字节；设为 0 可关闭） |
-| `JMW_IMAGE_CACHE_ENTRY_BYTES` | `2097152` | 单张封面缓存上限（字节，代码上限 4 MiB；超过后仍正常流式转发） |
-| `JMW_IMAGE_CACHE_TTL` | `86400` | 封面缓存有效期（秒，最短 60 秒） |
+| `JMW_IMAGE_CACHE_BYTES` | `67108864` | 图片进程内缓存总上限（字节，含正文；设为 0 可关闭） |
+| `JMW_IMAGE_CACHE_ENTRY_BYTES` | `2097152` | 单张图片缓存上限（字节，代码上限 4 MiB；超过后仍正常流式转发） |
+| `JMW_IMAGE_CACHE_TTL` | `86400` | 图片缓存有效期（秒，最短 60 秒） |
 | `JMW_IMAGE_QUEUE_LIMIT` | `96` | 图片代理等待队列上限（范围 0–512） |
 | `JMW_IMAGE_QUEUE_TIMEOUT` | `3000` | 单个图片请求排队最长时间（毫秒） |
 | `TRANSLATION_SERVICE_URL` | 直接运行为空；Compose 为 `http://translation-service:8091` | 翻译服务地址；显式留空则关闭主站翻译调用 |
@@ -265,6 +282,44 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 不要填写 `1`、`true` 或 `*`，也不要信任不受你控制的广泛网段。使用可信代理时，后端端口应继续绑定在回环/内部网络，不要同时绕过代理公开。
 
+#### 1Panel 部署要点
+
+推荐在 1Panel 的「容器 → 编排」中使用本仓库的 `docker-compose.yml`，或在服务器终端执行：
+
+```bash
+git clone https://github.com/shixian64/jm-web.git
+cd jm-web
+cp .env.example .env
+mkdir -p data
+sudo chown -R 1000:1000 data
+chmod 700 data
+# 编辑 .env：至少填写高强度 ACCESS_PASSWORD
+docker compose --env-file .env config --quiet
+docker compose --env-file .env up -d --build
+curl -fsS http://127.0.0.1:3210/healthz
+```
+
+如果 1Panel 的 OpenResty 在宿主机运行，`.env` 保持 `JMW_PUBLISH_HOST=127.0.0.1`、`JMW_PUBLISH_PORT=3210`，在 1Panel「网站 → 反向代理」中将代理地址设为 `http://127.0.0.1:3210`，再为网站申请 HTTPS 证书。使用同机宿主机代理时，`JMW_TRUST_PROXY` 通常留空即可。
+
+如果 1Panel 的 OpenResty 在 Docker 容器中，容器内的 `127.0.0.1` 指向 OpenResty 容器自己；此时应让代理容器与 `jm-web` 加入同一 Docker 网络并使用服务名，或使用代理容器能够访问的宿主机网关地址，同时把 `JMW_TRUST_PROXY` 设置为实际代理 IP/CIDR。不要为了省事直接把 3210 端口暴露给公网；1Panel 的 Docker bridge 网络与宿主机相互隔离，具体可达地址要以服务器上的容器网络检查结果为准。
+
+如果 1Panel 提供 Nginx 高级配置，可补充以下配置，避免 AI 流式响应被缓冲：
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Connection "";
+proxy_buffering off;
+proxy_request_buffering off;
+proxy_read_timeout 120s;
+proxy_send_timeout 120s;
+```
+
+建议使用独立域名或子域名的根路径（例如 `jm.example.com/`），不要直接挂在 `/jm-web/` 子路径下；当前前端资源、`/api` 和 PWA 路径按站点根路径生成。
+
 ## 使用说明
 
 1. 浏览器打开你配置的 HTTPS 域名；直接运行或已将 Compose 的 `JMW_PUBLISH_HOST` 改为 `0.0.0.0` 时，也可访问 `http://服务器IP:3210`。
@@ -277,7 +332,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 | 层 | 说明 |
 | --- | --- |
-| 后端 | 零依赖 Node.js（≥20），`server.js` + `lib/` |
+| 后端 | Node.js（≥20）+ `sharp` 运行依赖，`server.js` + `lib/` |
 | API 协议 | 与 jm-mobile 一致：`token` / `tokenparam` 请求头签名，响应 `data` 字段 AES-256-ECB 解密 |
 | 会话 | 每个浏览器一个 Cookie Jar（AVS 等），持久化到 `data/sessions/`，重启不丢登录态；空会话 7 天、登录会话默认 365 天自动清理，可由 `JMW_SESSION_TTL_SECONDS` 调整（7 天至 2 年） |
 | 图片 | 服务端按 HTTPS 域名白名单逐跳流式代理并限制大小/并发；解扰由浏览器 Worker/Canvas 完成 |
@@ -288,7 +343,7 @@ JMW_TRUST_PROXY=172.18.0.5,172.19.0.0/24
 
 ```text
 jm-web/
-├── server.js            零依赖 HTTP 服务器（API 代理 + 静态文件）
+├── server.js            HTTP 服务器（API 代理 + 静态文件）
 ├── lib/
 │   ├── jm-api.js        上游 API 客户端（签名 / AES 解密 / 域名故障切换）
 │   ├── photo.js         chapter_view_template HTML 解析

@@ -15,8 +15,8 @@
  *  JMW_MAX_CHAPTER_IMAGES 单章节图片数量上限（默认 2000）
  *  JMW_MAX_IMAGE_CONCURRENCY 图片代理全局并发（默认 12）
  *  JMW_MAX_IMAGE_CONCURRENCY_PER_IP 单客户端图片代理并发（默认 6）
- *  JMW_IMAGE_CACHE_BYTES 图片成功响应内存缓存总上限（默认 64 MiB）
- *  JMW_IMAGE_CACHE_ENTRY_BYTES 单张图片内存缓存上限（默认 2 MiB）
+ *  JMW_IMAGE_CACHE_BYTES 图片成功响应内存缓存总上限（默认 64 MiB，含正文）
+ *  JMW_IMAGE_CACHE_ENTRY_BYTES 单张图片内存缓存上限（默认 2 MiB，含正文）
  *  JMW_IMAGE_CACHE_TTL 图片内存缓存有效期秒数（默认 86400）
  *  JMW_IMAGE_QUEUE_LIMIT 图片代理等待队列上限（默认 96）
  *  JMW_IMAGE_QUEUE_TIMEOUT 图片代理排队最长等待毫秒（默认 3000）
@@ -115,12 +115,12 @@ const TRANSLATION_MAX_PAGE_BYTES = Math.min(
 const TRANSLATION_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 let activeImageRequests = 0;
 const imageRequestsByClient = new Map();
-// 只缓存成功的封面/缩略图，按字节和 TTL 双重限制；章节原图通常走流式转发，
-// 不会因为开启缓存而把大图长期留在 Node 堆中。
+// 只缓存成功的图片，按字节和 TTL 双重限制；单项有硬上限，章节原图过大时
+// 仍然走流式转发，不会因为开启缓存而把大图长期留在 Node 堆中。
 const imageCache = new Map();
 let imageCacheBytes = 0;
-// 同一封面在首屏突发请求期间只允许一个请求回源，其余请求等待该响应
-// 完成后复用缓存；非缓存正文不会进入此表。
+// 同一图片在首屏突发请求期间只允许一个请求回源，其余请求等待该响应
+// 完成后复用缓存。
 const imageCacheFlights = new Map();
 const imageWaitQueue = [];
 const imageWaitersByClient = new Map();
@@ -950,8 +950,8 @@ function validateImageUrl(url) {
 }
 
 /**
- * 封面请求通常来自 albums/library/album/novels 路径；章节正文位于 photos，
- * 不纳入进程缓存，避免一章数百张原图把内存预算吃满。
+ * 图片请求通常来自 albums/library/album/novels/photos 路径。正文也允许进入
+ * 有界缓存，以便回看和多标签页复用；总量和单项上限仍严格受环境变量控制。
  */
 function isCoverImagePath(pathname) {
   const value = String(pathname || '');
@@ -963,7 +963,7 @@ function isCoverImagePath(pathname) {
     try { decoded = decodeURIComponent(segment); } catch (_) { return false; }
     if (decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') || decoded.includes('\0')) return false;
   }
-  return /^\/media\/(?:albums|library\/album|novels)\//i.test(value);
+  return /^\/media\/(?:albums|library\/album|novels|photos)\//i.test(value);
 }
 
 function imageCacheKeyForPath(value) {
@@ -986,7 +986,17 @@ function cacheKeyForFetchedImage(requestedKey, finalUrl) {
   if (!requestedKey || !finalUrl) return '';
   try {
     const url = validateImageUrl(finalUrl);
-    return isCoverImagePath(url.pathname) ? requestedKey : '';
+    const finalCacheable = isCoverImagePath(url.pathname);
+    if (!finalCacheable) return '';
+    // 路径请求如果被上游重定向到另一类媒体，不能把正文写进封面键，
+    // 否则后续同一个封面地址可能错误命中正文响应。
+    if (String(requestedKey).startsWith('path:')) {
+      const requestedPath = String(requestedKey).slice(5).split('?', 1)[0];
+      const requestedChapter = /^\/media\/photos\//i.test(requestedPath);
+      const finalChapter = /^\/media\/photos\//i.test(url.pathname);
+      if (requestedChapter !== finalChapter) return '';
+    }
+    return requestedKey;
   } catch (_) {
     return '';
   }
@@ -1004,6 +1014,7 @@ function sendCachedImage(res, entry, cacheDays) {
     'Content-Type': entry.mime,
     'Content-Length': entry.body.length,
     'X-JMW-Image-Cache': 'HIT',
+    'X-Accel-Buffering': 'no',
   }));
   res.end(entry.body);
   return true;
@@ -1230,6 +1241,7 @@ async function sendUpstreamImage(
       'Cache-Control': imageCacheControl(cacheDays),
       'Content-Type': mime,
       'X-JMW-Image-Cache': cacheKey ? 'MISS' : 'BYPASS',
+      'X-Accel-Buffering': 'no',
       // fetch 可能已解压响应体，不能直接转发上游 Content-Length。
     }));
 

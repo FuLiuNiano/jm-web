@@ -4,7 +4,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'jmw-shell-v14';
+const CACHE_VERSION = 'jmw-shell-v17';
 const SHELL = [
   '/',
   '/index.html',

@@ -88,9 +88,18 @@ export function createReaderSettings(options) {
   shuntSelect.addEventListener('change', () => options.onSetting('shunt', shuntSelect.value));
 
   const prefetchSelect = h('select', { class: 'r-setting-select', 'aria-label': '阅读预加载数量' },
-    ...[1, 3, 5, 8].map((value) => h('option', { value: String(value) }, `${value} 页`)),
+    ...[1, 2, 3, 5, 8].map((value) => h('option', { value: String(value) }, `${value} 页`)),
   );
   prefetchSelect.addEventListener('change', () => options.onSetting('prefetchCount', Number(prefetchSelect.value)));
+
+  const recapSkip = h('input', {
+    type: 'checkbox', class: 'r-switch', 'aria-label': '跳过开头回顾',
+  });
+  recapSkip.addEventListener('change', () => options.onSetting('recapSkipEnabled', recapSkip.checked));
+  const recapPages = h('select', { class: 'r-setting-select', 'aria-label': '跳过开头回顾页数' },
+    ...[1, 2, 3, 4, 5, 8, 10, 12].map((value) => h('option', { value: String(value) }, `${value} 页`)),
+  );
+  recapPages.addEventListener('change', () => options.onSetting('recapSkipPages', Number(recapPages.value)));
 
   const fitSelect = h('select', { class: 'r-setting-select', 'aria-label': '图片适配方式' },
     h('option', { value: 'contain' }, '完整显示'),
@@ -129,6 +138,16 @@ export function createReaderSettings(options) {
     ...[1, 2, 3, 4].map((value) => h('option', { value: String(value) }, `${value} 路`)),
   );
   decodeConcurrency.addEventListener('change', () => options.onSetting('readDecodeConcurrency', Number(decodeConcurrency.value)));
+  const translation = h('input', {
+    type: 'checkbox', class: 'r-switch', 'aria-label': '启用漫画翻译',
+  });
+  translation.addEventListener('change', () => options.onSetting('readerTranslationEnabled', translation.checked));
+  const continuousPrefetch = h('input', {
+    type: 'checkbox', class: 'r-switch', 'aria-label': '连续预缓存后续图片',
+  });
+  continuousPrefetch.addEventListener('change', () => options.onSetting(
+    'readerContinuousPrefetchEnabled', continuousPrefetch.checked,
+  ));
 
   const zoomValue = h('output', { class: 'r-setting-value' }, '100%');
   const zoom = h('input', {
@@ -208,9 +227,17 @@ export function createReaderSettings(options) {
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
             h('span', { class: 'r-setting-label' }, '预加载数量'),
-            h('span', { class: 'r-setting-desc' }, '按设备性能控制前后缓存页数'),
+            h('span', { class: 'r-setting-desc' }, '按网络和设备性能控制缓存页数'),
           ),
           prefetchSelect,
+        ),
+        switchRow('跳过开头回顾', '自动比对上一话末尾页面；识别不到时可手动指定', recapSkip),
+        h('label', { class: 'r-setting-row' },
+          h('span', { class: 'r-setting-copy' },
+            h('span', { class: 'r-setting-label' }, '回顾页数'),
+            h('span', { class: 'r-setting-desc' }, '关闭后不会删除图片或离线缓存'),
+          ),
+          recapPages,
         ),
         switchRow('内存优化', '限制同时解码数和缓存，适合内存较小的设备', memoryOpt),
         h('label', { class: 'r-setting-row' },
@@ -220,6 +247,8 @@ export function createReaderSettings(options) {
           ),
           decodeConcurrency,
         ),
+        switchRow('启用漫画翻译', '会增加首图等待和服务器 CPU 占用，追求速度时建议关闭', translation),
+        switchRow('连续预缓存', '后台按顺序缓存后续页面，可能增加流量；关闭后只加载附近页面', continuousPrefetch),
       ),
       h('section', { class: 'r-setting-section r-progress-section' },
         h('h4', null, '阅读进度'),
@@ -246,8 +275,13 @@ export function createReaderSettings(options) {
     themeSelect.value = ['auto', 'light', 'dark'].includes(s.theme) ? s.theme : 'auto';
     shuntSelect.value = ['1', '2', '3', '4'].includes(String(s.shunt)) ? String(s.shunt) : '1';
     shuntSelect.disabled = s.offline === true || s.sourceRefreshPending === true || !s.sourceReady;
-    prefetchSelect.value = ['1', '3', '5', '8'].includes(String(s.prefetchCount))
+    prefetchSelect.value = ['1', '2', '3', '5', '8'].includes(String(s.prefetchCount))
       ? String(s.prefetchCount) : '3';
+    recapSkip.checked = s.recapSkipEnabled === true;
+    recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12'].includes(String(s.recapSkipPages))
+      ? String(s.recapSkipPages) : '1';
+    recapSkip.disabled = s.recapAvailable === false;
+    recapPages.disabled = !recapSkip.checked || s.recapAvailable === false;
     followBrightness.checked = s.brightnessFollowSystem !== false;
     brightness.value = String(Math.round(clamp(s.brightness ?? 1, .2, 1) * 100));
     brightness.disabled = followBrightness.checked;
@@ -259,6 +293,10 @@ export function createReaderSettings(options) {
     memoryOpt.checked = s.readMemoryOptEnabled === true;
     decodeConcurrency.value = String(clamp(s.readDecodeConcurrency || 2, 1, 4));
     decodeConcurrency.disabled = !memoryOpt.checked;
+    translation.checked = s.readerTranslationEnabled === true;
+    translation.disabled = s.offline === true || s.translationAvailable === false;
+    continuousPrefetch.checked = s.readerContinuousPrefetchEnabled !== false;
+    continuousPrefetch.disabled = s.offline === true || s.sourceReady === false;
     zoom.value = String(Math.round(clamp(s.zoom || 1, 1, 4) * 100));
     zoom.disabled = !supportZoom.checked || mode === 'scroll';
     zoomValue.textContent = `${zoom.value}%`;

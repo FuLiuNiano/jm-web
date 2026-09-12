@@ -90,6 +90,7 @@ mustMatch(workflow, /linux\/amd64,linux\/arm64/, '镜像 workflow 必须发布 x
 mustMatch(workflow, /packages:\s*write/, '镜像 workflow 必须允许写入 GHCR');
 mustMatch(workflow, /docker\/build-push-action@v6/, '镜像 workflow 必须使用 Buildx 发布');
 mustMatch(workflow, /if: github\.event_name != 'pull_request'/, 'Pull Request 不得发布镜像');
+mustMatch(workflow, /npm ci(?:\s+--ignore-scripts=false)?/, 'GitHub Actions 必须先安装锁定的 Node.js 依赖');
 assert.ok(fs.statSync(artifactValidator).mode & 0o111, '制品校验脚本必须可执行');
 mustMatch(read('package.json'), /"validate:artifact"\s*:/, 'package.json 必须提供制品校验入口');
 

@@ -49,6 +49,80 @@ export function recommendedDecodeConcurrency({ deviceMemory, memoryOptimized = f
   return 3;
 }
 
+/**
+ * 根据网络和设备能力收紧预加载窗口。用户选择的数量仍是上限，省流量、
+ * 慢网络和低内存设备不会为了邻页把图片代理和解码队列一次性占满。
+ */
+export function recommendedPrefetchCount({ configured = 3, deviceMemory, effectiveType, saveData = false } = {}) {
+  const count = Math.max(1, Math.min(12, Math.trunc(Number(configured) || 3)));
+  const type = String(effectiveType || '').toLowerCase();
+  if (saveData === true || type === 'slow-2g' || type === '2g') return Math.min(count, 1);
+  const dm = Number(deviceMemory);
+  if (Number.isFinite(dm) && dm > 0) {
+    if (dm <= 1) return Math.min(count, 1);
+    if (dm <= 2) return Math.min(count, 2);
+  }
+  if (type === '3g') return Math.min(count, 2);
+  return count;
+}
+
+/** 规范化“每章开头跳过回顾页数”，最多保留 20 页的安全上限。 */
+export function normalizeRecapSkipPages(value) {
+  return Math.max(0, Math.min(20, Math.trunc(Number(value) || 0)));
+}
+
+/**
+ * 只在阅读器视图中跳过开头页，保留原数组对象和离线 index，方便关闭设置后恢复。
+ * 至少保留一页，避免误设页数后把章节变成空章节。
+ */
+export function filterReaderImages(images, skipPages = 0) {
+  if (!Array.isArray(images)) return [];
+  const skip = Math.min(normalizeRecapSkipPages(skipPages), Math.max(0, images.length - 1));
+  return images.slice(skip);
+}
+
+function imageIdentity(value) {
+  const raw = typeof value === 'object' && value !== null
+    ? (value.url || value.name || value.page) : value;
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text);
+    // 不比较 CDN 域名和临时签名参数；同一张图片切换线路后仍应能识别。
+    return parsed.pathname.toLowerCase();
+  } catch (_) {
+    return text.split(/[?#]/, 1)[0].toLowerCase();
+  }
+}
+
+/**
+ * 通过“上一话末尾页 = 本话开头页”识别重复回顾。至少连续重复两页才自动跳过，
+ * 以免把恰好相同的封面或章节扉页误判成回顾；识别失败时返回 0，保留原页面。
+ */
+export function detectRecapPageCount(currentImages, previousImages, maxPages = 12) {
+  if (!Array.isArray(currentImages) || !Array.isArray(previousImages)
+      || currentImages.length < 2 || !previousImages.length) return 0;
+  const limit = Math.min(
+    Math.max(0, Math.trunc(Number(maxPages) || 12)),
+    currentImages.length - 1,
+    previousImages.length,
+  );
+  for (let count = limit; count >= 2; count--) {
+    const previousStart = previousImages.length - count;
+    let same = true;
+    for (let index = 0; index < count; index++) {
+      const current = imageIdentity(currentImages[index]);
+      const previous = imageIdentity(previousImages[previousStart + index]);
+      if (!current || current !== previous) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return count;
+  }
+  return 0;
+}
+
 export function normalizeChapterImages(value) {
   if (!Array.isArray(value)) return [];
   const images = [];
@@ -81,9 +155,10 @@ export function normalizeReaderSeries(value) {
 
 /**
  * 生成阅读器预取顺序。prefetchCount 表示当前页两侧各自的最大半径，
- * 不再额外扩大窗口；顺序对齐客户端：当前页、后续页、前序页。
+ * 不再额外扩大窗口；顺序对齐客户端：当前页、后续页、前序页。连续滚动时
+ * 可指定 forward，只调度当前页和后续页。
  */
-export function readerPrefetchOrder(current, total, prefetchCount) {
+export function readerPrefetchOrder(current, total, prefetchCount, direction = 'both') {
   const length = Math.max(0, Math.trunc(Number(total) || 0));
   const center = Math.trunc(Number(current));
   if (!Number.isInteger(center) || center < 0 || center >= length) return [];
@@ -92,16 +167,18 @@ export function readerPrefetchOrder(current, total, prefetchCount) {
   for (let distance = 1; distance <= radius; distance++) {
     if (center + distance < length) order.push(center + distance);
   }
-  for (let distance = 1; distance <= radius; distance++) {
-    if (center - distance >= 0) order.push(center - distance);
+  if (direction !== 'forward') {
+    for (let distance = 1; distance <= radius; distance++) {
+      if (center - distance >= 0) order.push(center - distance);
+    }
   }
   return order;
 }
 
 /** 仅保留严格预取窗口内的合法页码，同时维持调用方原有顺序。 */
-export function filterReaderPrefetchWindow(indices, current, total, prefetchCount) {
+export function filterReaderPrefetchWindow(indices, current, total, prefetchCount, direction = 'both') {
   if (!Array.isArray(indices)) return [];
-  const allowed = new Set(readerPrefetchOrder(current, total, prefetchCount));
+  const allowed = new Set(readerPrefetchOrder(current, total, prefetchCount, direction));
   return indices.filter((index) => Number.isInteger(index) && allowed.has(index));
 }
 
@@ -179,7 +256,10 @@ export function mountReader(root, photoId, query, options = {}) {
     cover: null,
     chapters: [], // [{id, name}]
     curChapterIdx: -1,
+    sourceImages: [], // 章节原始图片；state.images 可能按设置隐藏开头回顾页
     images: [],
+    recapSkipPages: 0,
+    recapAutoSkipPages: 0,
     scrambleId: 0,
     speed: '',
     mode: savedMode,
@@ -188,7 +268,8 @@ export function mountReader(root, photoId, query, options = {}) {
     zoom: 1,
     panX: 0,
     panY: 0,
-    decoded: new Map(),  // idx -> { url, width, height }
+    decoded: new Map(),  // idx -> { url, width, height, direct? }
+    directPreloads: new Map(), // 翻页模式下为邻页建立浏览器原生预取
     raws: new Map(),     // idx -> blob（原始图缓存，按字节预算的 LRU）
     rawBytes: 0,
     dims: new Map(),     // idx -> {width, height}
@@ -220,6 +301,136 @@ export function mountReader(root, photoId, query, options = {}) {
   let wakeLock = null;
   let explicitStartPending = requestedPage != null;
   const deviceMemory = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
+  let recapDetectionSeq = 0;
+  let continuousPrefetchSeq = 0;
+  let continuousPrefetchRunning = false;
+  let continuousPrefetchNext = 0;
+
+  function revokeReaderObjectUrl(url) {
+    // 流式原图使用 /api/img 地址，不能把普通 HTTP URL 交给 revokeObjectURL。
+    if (typeof url === 'string' && url.startsWith('blob:')) URL.revokeObjectURL(url);
+  }
+
+  function clearDirectPreloads() {
+    state.directPreloads.clear();
+  }
+
+  function stopContinuousPrefetch() {
+    continuousPrefetchSeq++;
+  }
+
+  function recapSettingKey() {
+    const raw = String(state.aid || '').trim();
+    if (/^[\w:-]{1,80}$/.test(raw)) return raw;
+    return `chapter:${String(state.photoId || '').replace(/[^\w-]/g, '').slice(0, 40)}`;
+  }
+
+  function storedRecapSkipPages() {
+    const map = setting.readerRecapPagesByComic;
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return 0;
+    return normalizeRecapSkipPages(map[recapSettingKey()]);
+  }
+
+  function configuredRecapSkipPages() {
+    const manual = storedRecapSkipPages();
+    if (manual > 0) return manual;
+    return setting.readerRecapAutoEnabled !== false ? state.recapAutoSkipPages : 0;
+  }
+
+  function setSourceImages(images) {
+    const previousImage = state.images[state.cur];
+    state.sourceImages = Array.isArray(images) ? images : [];
+    state.recapSkipPages = Math.min(
+      configuredRecapSkipPages(),
+      Math.max(0, state.sourceImages.length - 1),
+    );
+    state.images = filterReaderImages(state.sourceImages, state.recapSkipPages);
+    const preservedIndex = previousImage ? state.images.indexOf(previousImage) : -1;
+    if (preservedIndex >= 0) state.cur = preservedIndex;
+    else state.cur = Math.min(Math.max(0, state.cur), Math.max(0, state.images.length - 1));
+  }
+
+  function persistRecapSkipPages(pages) {
+    const current = setting.readerRecapPagesByComic;
+    const next = {};
+    if (current && typeof current === 'object' && !Array.isArray(current)) {
+      for (const [key, value] of Object.entries(current).slice(-300)) {
+        if (!/^[\w:-]{1,80}$/.test(key)) continue;
+        const safe = normalizeRecapSkipPages(value);
+        if (safe > 0) next[key] = safe;
+      }
+    }
+    const safePages = normalizeRecapSkipPages(pages);
+    if (safePages > 0) next[recapSettingKey()] = safePages;
+    else delete next[recapSettingKey()];
+    updateSetting({ readerRecapPagesByComic: next });
+  }
+
+  function currentSourceIndex() {
+    const image = state.images[state.cur];
+    const index = image ? state.sourceImages.indexOf(image) : -1;
+    return index >= 0 ? index : state.cur + state.recapSkipPages;
+  }
+
+  function effectivePrefetchCount() {
+    const network = typeof navigator !== 'undefined'
+      ? (navigator.connection || navigator.mozConnection || navigator.webkitConnection)
+      : null;
+    return recommendedPrefetchCount({
+      configured: setting.prefetchCount,
+      deviceMemory,
+      effectiveType: network?.effectiveType,
+      saveData: network?.saveData === true,
+    });
+  }
+
+  function resetDecodedAfterImageListChange() {
+    restartImagePipeline({ reuseDecoded: false });
+    stopContinuousPrefetch();
+    continuousPrefetchNext = 0;
+    clearDirectPreloads();
+    for (const rec of state.decoded.values()) if (rec?.url) revokeReaderObjectUrl(rec.url);
+    state.decoded.clear();
+    state.dims.clear();
+    for (const url of retiredObjectUrls) revokeReaderObjectUrl(url);
+    retiredObjectUrls.clear();
+  }
+
+  async function previousChapterImages(chapter) {
+    if (!chapter?.id) return [];
+    if (!offline) {
+      const data = await readerRequest(`/chapter?id=${encodeURIComponent(chapter.id)}&shunt=${encodeURIComponent(activeImageShunt)}`);
+      const payload = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
+        ? data.data : {};
+      return normalizeChapterImages(payload.images);
+    }
+    const rows = await listOfflineImages(state.aid, chapter.id, { includeBlob: false });
+    return Array.isArray(rows) ? rows.slice().sort((a, b) => Number(a?.index) - Number(b?.index)) : [];
+  }
+
+  async function detectRecapInBackground() {
+    if (state.destroyed || signal.aborted || setting.readerRecapAutoEnabled === false
+        || storedRecapSkipPages() > 0 || state.curChapterIdx <= 0 || !state.sourceImages.length) return;
+    const previous = state.chapters[state.curChapterIdx - 1];
+    if (!previous?.id) return;
+    const seq = ++recapDetectionSeq;
+    try {
+      const images = await previousChapterImages(previous);
+      if (state.destroyed || signal.aborted || seq !== recapDetectionSeq
+          || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
+      const pages = detectRecapPageCount(state.sourceImages, images);
+      if (!pages || pages === state.recapAutoSkipPages) return;
+      const oldPages = state.recapSkipPages;
+      state.recapAutoSkipPages = pages;
+      setSourceImages(state.sourceImages);
+      if (state.recapSkipPages === oldPages) return;
+      resetDecodedAfterImageListChange();
+      render();
+      showHint(`已自动识别并跳过上一话回顾 ${state.recapSkipPages} 页`);
+    } catch (_) {
+      // 回顾识别是后台增强功能；上一话请求失败时不影响当前章节阅读。
+    }
+  }
 
   function rawCacheLimitBytes() {
     return readerRawCacheBytes({
@@ -505,6 +716,9 @@ export function mountReader(root, photoId, query, options = {}) {
       theme: setting.theme,
       shunt: setting.shunt,
       prefetchCount: setting.prefetchCount,
+      readerContinuousPrefetchEnabled: setting.readerContinuousPrefetchEnabled !== false,
+      readerTranslationEnabled: setting.readerTranslationEnabled === true,
+      translationAvailable: state.translationAvailable,
       offline,
       sourceReady: state.images.length > 0,
       sourceRefreshPending,
@@ -521,6 +735,9 @@ export function mountReader(root, photoId, query, options = {}) {
       zoom: state.zoom,
       current: state.cur,
       total: state.images.length,
+      recapAvailable: state.sourceImages.length > 1,
+      recapSkipEnabled: state.recapSkipPages > 0,
+      recapSkipPages: state.recapSkipPages || 1,
       hasPreviousChapter: state.curChapterIdx > 0,
       hasNextChapter: state.curChapterIdx >= 0 && state.curChapterIdx < state.chapters.length - 1,
     };
@@ -545,12 +762,29 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function changeReaderSetting(key, value) {
     if (state.destroyed) return;
+    if (key === 'recapSkipEnabled' || key === 'recapSkipPages') {
+      const previous = state.recapSkipPages;
+      let pages = key === 'recapSkipPages' ? normalizeRecapSkipPages(value) : previous || 1;
+      if (key === 'recapSkipEnabled' && value !== true) pages = 0;
+      if (key === 'recapSkipEnabled' && value !== true) state.recapAutoSkipPages = 0;
+      persistRecapSkipPages(pages);
+      setSourceImages(state.sourceImages);
+      if (pages !== previous) {
+        resetDecodedAfterImageListChange();
+        render();
+        if (state.recapSkipPages > 0) showHint(`已跳过开头 ${state.recapSkipPages} 页`);
+      }
+      applyReaderSettings();
+      return;
+    }
     if (key === 'theme' && !['auto', 'light', 'dark'].includes(value)) return;
     if (key === 'shunt') {
       value = String(value);
       if (!['1', '2', '3', '4'].includes(value)) return;
     }
     if (key === 'prefetchCount') value = Math.max(1, Math.min(12, Number(value) || 3));
+    if (key === 'readerContinuousPrefetchEnabled') value = value === true;
+    if (key === 'readerTranslationEnabled') value = value === true;
     const previous = setting[key];
     const patch = { [key]: value };
     if (key === 'brightness') patch.brightness = Math.max(.2, Math.min(1, Number(value) || 1));
@@ -562,6 +796,17 @@ export function mountReader(root, photoId, query, options = {}) {
     }
     if (key === 'supportZoom' && value === false) resetZoom();
     if (key === 'readMemoryOptEnabled') trimRawCache();
+    if (key === 'readerTranslationEnabled' && previous !== value && state.images.length) {
+      restartImagePipeline({ reuseDecoded: false });
+      render();
+    }
+    if (key === 'readerContinuousPrefetchEnabled') {
+      stopContinuousPrefetch();
+      if (value === true) {
+        continuousPrefetchNext = Math.max(0, state.cur + effectivePrefetchCount() + 1);
+        scheduleContinuousPrefetch();
+      }
+    }
     if (key === 'keepAwake') syncWakeLock(true);
     if (key === 'prefetchCount' && Number(previous) !== Number(value)) refreshPrefetchWindow();
     if (key === 'shunt' && String(previous) !== value && !offline && state.images.length) {
@@ -780,6 +1025,7 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return; // 路由清理与手动 close 可能双重触发
     flushHistory();
     state.destroyed = true;
+    stopContinuousPrefetch();
     sourceRefreshSeq++;
     imageController.abort();
     abortController.abort();
@@ -814,8 +1060,9 @@ export function mountReader(root, photoId, query, options = {}) {
     restoreTimer = null;
     hint.classList.remove('show');
     decodeQueue.clear();
-    for (const d of state.decoded.values()) URL.revokeObjectURL(d.url);
-    for (const url of retiredObjectUrls) URL.revokeObjectURL(url);
+    clearDirectPreloads();
+    for (const d of state.decoded.values()) revokeReaderObjectUrl(d.url);
+    for (const url of retiredObjectUrls) revokeReaderObjectUrl(url);
     retiredObjectUrls.clear();
     state.decoded.clear();
     clearRawCache();
@@ -863,7 +1110,7 @@ export function mountReader(root, photoId, query, options = {}) {
         }
         state.albumName = album?.name || '';
         // 按持久化 index 放入定长数组，绝不让缺失的中间页导致后续页码前移。
-        state.images = imageSlots;
+        setSourceImages(imageSlots);
         state.chapters = chapters.filter((item) => item.complete === true).map((item, index) => ({
           id: String(item.photoId), name: String(item.name || ''), sort: Number(item.sort) || index,
         })).sort((a, b) => a.sort - b.sort);
@@ -876,6 +1123,7 @@ export function mountReader(root, photoId, query, options = {}) {
         container.querySelector('.r-loading')?.remove();
         titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
         render();
+        detectRecapInBackground();
       } catch (e) {
         if (!state.destroyed) showFatal(e.message || '无法打开离线章节');
       }
@@ -888,6 +1136,13 @@ export function mountReader(root, photoId, query, options = {}) {
     const translationConfigPromise = fetch('/api/config', {
       credentials: 'same-origin', signal,
     }).then((res) => (res.ok ? res.json() : null)).catch(() => null);
+    // 能力探测不应阻塞首图。翻译属于增强功能，配置返回后只更新设置面板；
+    // 默认关闭时，正文直接走原图流式路径。
+    translationConfigPromise.then((config) => {
+      if (state.destroyed || signal.aborted) return;
+      state.translationAvailable = config?.translation?.available === true;
+      settingsUI.refresh();
+    });
     let data;
     const requestedShunt = ['1', '2', '3', '4'].includes(String(setting.shunt)) ? String(setting.shunt) : '1';
     try {
@@ -900,7 +1155,7 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return;
     const d = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
       ? data.data : {};
-    state.images = normalizeChapterImages(d.images);
+    setSourceImages(normalizeChapterImages(d.images));
     if (!state.images.length) {
       showFatal('章节没有返回可读取的安全图片，请稍后重试或切换线路');
       return;
@@ -908,14 +1163,6 @@ export function mountReader(root, photoId, query, options = {}) {
     state.scrambleId = d.scrambleId || 0;
     state.speed = d.speed || '';
     activeImageShunt = requestedShunt;
-
-    // 配置是本机请求，正常应在毫秒级完成；设置上限避免异常时再次阻塞首图。
-    const config = await Promise.race([
-      translationConfigPromise,
-      new Promise((resolve) => setTimeout(() => resolve(null), 500)),
-    ]);
-    if (state.destroyed || signal.aborted) return;
-    state.translationAvailable = config?.translation?.available === true;
 
     // 章节图片已就绪时立即挂载首屏；详情只负责标题、封面和章节抽屉，后台补齐。
     container.querySelector('.r-loading')?.remove();
@@ -955,6 +1202,7 @@ export function mountReader(root, photoId, query, options = {}) {
 
     titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
     render();
+    detectRecapInBackground();
   }
 
   function showFatal(msg) {
@@ -1020,6 +1268,8 @@ export function mountReader(root, photoId, query, options = {}) {
       });
     } else {
       // 分流变更后 URL/解扰参数可能改变，原始响应绝不能跨线路复用。
+      stopContinuousPrefetch();
+      continuousPrefetchNext = 0;
       imageSourceVersion++;
       clearRawCache();
     }
@@ -1053,7 +1303,7 @@ export function mountReader(root, photoId, query, options = {}) {
 
       const previousTotal = state.images.length;
       restartImagePipeline({ reuseDecoded: false });
-      state.images = nextImages;
+      setSourceImages(nextImages);
       state.scrambleId = next.scrambleId || 0;
       state.speed = next.speed || '';
       state.cur = Math.max(0, Math.min(state.images.length - 1, state.cur));
@@ -1108,6 +1358,98 @@ export function mountReader(root, photoId, query, options = {}) {
     return chapterImgSrc(state.images[idx].url);
   }
 
+  function primeDirectImage(idx, url) {
+    if (!isPagedMode() || idx === state.cur || typeof Image !== 'function') return;
+    const previous = state.directPreloads.get(idx);
+    if (previous?.url === url) return;
+    const image = new Image();
+    image.decoding = 'async';
+    image.fetchPriority = 'low';
+    image.src = url;
+    state.directPreloads.set(idx, { url, image });
+  }
+
+  function canUseProgressiveRawImage(idx) {
+    return !offline
+      && setting.readerTranslationEnabled !== true
+      && isRaw(idx)
+      && Boolean(srcOf(idx));
+  }
+
+  async function prefetchRawImageForCache(idx, generation, imageSignal) {
+    assertImageActive(generation, imageSignal);
+    const response = await fetch(srcOf(idx), {
+      headers: { 'X-JMW-Data-Source': selectedDataSource() },
+      credentials: 'same-origin',
+      cache: 'default',
+      priority: 'low',
+      signal: imageSignal,
+    });
+    if (!response.ok) throw new Error(`图片 ${idx + 1} 获取失败（${response.status}）`);
+    const responseMime = String(response.headers?.get('content-type') || '')
+      .split(';', 1)[0].trim().toLowerCase();
+    if (!SAFE_IMAGE_MIME.has(responseMime)) throw new Error(`图片 ${idx + 1} 返回了不支持的内容类型`);
+    // 必须消费响应体，浏览器和服务端缓存才有机会留下完整正文；一次只消费一页，
+    // 不把“连续预缓存”变成整章常驻内存。
+    const body = await response.arrayBuffer();
+    if (!body.byteLength) throw new Error(`图片 ${idx + 1} 返回了空内容`);
+    assertImageActive(generation, imageSignal);
+    return true;
+  }
+
+  async function prefetchOneForCache(idx, generation, sourceVersion, imageSignal) {
+    if (canUseProgressiveRawImage(idx)) {
+      return prefetchRawImageForCache(idx, generation, imageSignal);
+    }
+    const rec = await ensureDecoded(idx);
+    if (!rec || generation !== imageGeneration || sourceVersion !== imageSourceVersion) return false;
+    evictDecoded(idx, rec);
+    return true;
+  }
+
+  function scheduleContinuousPrefetch() {
+    if (state.destroyed || signal.aborted || offline
+        || setting.readerContinuousPrefetchEnabled === false
+        || !state.images.length || continuousPrefetchRunning) return;
+    const sequence = continuousPrefetchSeq;
+    const generation = imageGeneration;
+    const sourceVersion = imageSourceVersion;
+    continuousPrefetchRunning = true;
+    (async () => {
+      let next = continuousPrefetchNext;
+      while (!state.destroyed && !signal.aborted
+          && sequence === continuousPrefetchSeq
+          && setting.readerContinuousPrefetchEnabled !== false
+          && generation === imageGeneration && sourceVersion === imageSourceVersion) {
+        const minimum = state.cur + effectivePrefetchCount() + 1;
+        const idx = Math.max(next, minimum);
+        if (idx >= state.images.length) break;
+        try {
+          const ok = await prefetchOneForCache(idx, generation, sourceVersion, imageController.signal);
+          if (!ok) {
+            continuousPrefetchNext = idx;
+            break;
+          }
+          continuousPrefetchNext = idx + 1;
+          next = continuousPrefetchNext;
+        } catch (error) {
+          if (error?.name === 'AbortError' || state.destroyed || signal.aborted) break;
+          // 上游暂时失败时暂停连续任务，交给用户当前页的重试/下一次移动恢复，
+          // 避免后台循环持续重试反而挤占正在阅读的图片请求。
+          continuousPrefetchNext = idx;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+    })().finally(() => {
+      const restart = !state.destroyed && !signal.aborted
+        && setting.readerContinuousPrefetchEnabled !== false
+        && sequence !== continuousPrefetchSeq;
+      continuousPrefetchRunning = false;
+      if (restart) scheduleContinuousPrefetch();
+    });
+  }
+
   async function getRawBlob(idx, generation, imageSignal) {
     assertImageActive(generation, imageSignal);
     if (state.raws.has(idx)) {
@@ -1152,7 +1494,7 @@ export function mountReader(root, photoId, query, options = {}) {
    */
   async function translatePageBlob(blob, idx, generation, sourceVersion, imageSignal) {
     if (!(blob instanceof Blob) || !blob.size) return null;
-    if (state.translationAvailable !== true) return null;
+    if (setting.readerTranslationEnabled !== true || state.translationAvailable !== true) return null;
     const query = new URLSearchParams({
       aid: String(state.aid || ''),
       photoId: String(state.photoId || ''),
@@ -1222,13 +1564,28 @@ export function mountReader(root, photoId, query, options = {}) {
       if (slot.dataset.objectUrl === rec.url) mounted = true;
     });
     if (mounted) retiredObjectUrls.add(rec.url);
-    else URL.revokeObjectURL(rec.url);
+    else revokeReaderObjectUrl(rec.url);
   }
 
   async function doDecode(idx, generation, sourceVersion, imageSignal) {
     let acquired = false;
     try {
       assertImageActive(generation, imageSignal);
+      if (canUseProgressiveRawImage(idx)) {
+        const url = srcOf(idx);
+        const previous = state.decoded.get(idx);
+        const dims = state.dims.get(idx);
+        const rec = {
+          url, generation, sourceVersion,
+          width: dims?.width,
+          height: dims?.height,
+          direct: true,
+        };
+        retireDecoded(previous);
+        state.decoded.set(idx, rec);
+        primeDirectImage(idx, url);
+        return rec;
+      }
       // 限制完整的“取图 + 解扰/校验”任务，而不只是 Canvas 解扰阶段。
       // 否则一次预取可同时发出二十余个图片请求，挤满服务端图片代理槽位。
       while (activeDecodes >= decodeConcurrency()) {
@@ -1399,10 +1756,14 @@ export function mountReader(root, photoId, query, options = {}) {
     slot.dataset.mounted = '1';
     slot.dataset.generation = String(rec.generation);
     slot.dataset.objectUrl = rec.url;
+    if (rec.direct) state.directPreloads.delete(idx);
     const knownWidth = Number(rec.width || state.dims.get(idx)?.width);
     const knownHeight = Number(rec.height || state.dims.get(idx)?.height);
     const image = h('img', {
       src: rec.url, alt: `第${idx + 1}页`, draggable: 'false',
+      loading: idx === state.cur ? 'eager' : 'lazy',
+      decoding: 'async',
+      fetchpriority: idx === state.cur ? 'high' : 'low',
       ...(Number.isFinite(knownWidth) && knownWidth > 0 && Number.isFinite(knownHeight) && knownHeight > 0
         ? { width: String(knownWidth), height: String(knownHeight) }
         : {}),
@@ -1422,7 +1783,7 @@ export function mountReader(root, photoId, query, options = {}) {
         // 只处理仍属于当前槽位的记录，避免快速翻页后的迟到 error 污染新页。
         if (state.destroyed || !slot.isConnected || slot.dataset.idx !== String(idx)
             || state.decoded.get(idx) !== rec) return;
-        URL.revokeObjectURL(rec.url);
+        revokeReaderObjectUrl(rec.url);
         state.decoded.delete(idx);
         dropRaw(idx);
         state.dims.delete(idx);
@@ -1443,7 +1804,7 @@ export function mountReader(root, photoId, query, options = {}) {
     }
     restoreScrollAnchor(scrollAnchor);
     if (previousObjectUrl && previousObjectUrl !== rec.url && retiredObjectUrls.delete(previousObjectUrl)) {
-      URL.revokeObjectURL(previousObjectUrl);
+      revokeReaderObjectUrl(previousObjectUrl);
     }
   }
 
@@ -1485,15 +1846,31 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function prefetchAround(idx) {
     if (state.destroyed || signal.aborted) return;
-    const n = Math.max(1, Math.min(12, Math.trunc(Number(setting.prefetchCount) || 3)));
+    const n = effectivePrefetchCount();
     const start = Math.max(0, idx - n);
     const end = Math.min(state.images.length - 1, idx + n);
-    const order = readerPrefetchOrder(idx, state.images.length, n);
+    // 连续滚动时用户几乎总是向后阅读，优先把带宽留给后续页面；翻页模式
+    // 仍保留前后窗口，方便左右翻回上一页。
+    const direction = state.mode === 'scroll' ? 'forward' : 'both';
+    const order = readerPrefetchOrder(idx, state.images.length, n, direction);
     const generation = imageGeneration;
     const sourceVersion = imageSourceVersion;
     const sequence = ++prefetchSequence;
     const isActive = () => !state.destroyed && !signal.aborted && sequence === prefetchSequence
       && generation === imageGeneration && sourceVersion === imageSourceVersion && state.cur === idx;
+    // 当前页仍拥有 high 优先级和第一个解码槽；仅给紧邻下一页一个短暂提前量，
+    // 把“当前页下载完成后才开始下一页”的空窗缩短，快速翻页时更不容易白屏。
+    if (order.length > 1) {
+      const nextIndex = order[1];
+      setTimeout(() => {
+        if (!isActive()) return;
+        ensureDecoded(nextIndex).then((rec) => {
+          if (!rec) return;
+          if (isActive() && state.mode === 'scroll') mountSlot(nextIndex);
+          else if (!isActive()) evictLatePrefetchResult(nextIndex, rec);
+        }, () => {});
+      }, 120);
+    }
     scheduleReaderPrefetch(order, ensureDecoded, (i) => {
       if (state.mode === 'scroll') mountSlot(i);
     }, isActive, evictLatePrefetchResult);
@@ -1502,11 +1879,15 @@ export function mountReader(root, photoId, query, options = {}) {
     for (const [k, v] of state.decoded) {
       if (k < start || k > end) evictDecoded(k, v);
     }
+    for (const k of state.directPreloads.keys()) {
+      if (k < start || k > end) state.directPreloads.delete(k);
+    }
+    scheduleContinuousPrefetch();
   }
 
   function evictDecoded(idx, rec) {
     if (!rec || state.decoded.get(idx) !== rec) return;
-    URL.revokeObjectURL(rec.url);
+    revokeReaderObjectUrl(rec.url);
     state.decoded.delete(idx);
     const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
     if (slot?.dataset.objectUrl === rec.url) {
@@ -1521,7 +1902,7 @@ export function mountReader(root, photoId, query, options = {}) {
   function evictLatePrefetchResult(idx, rec) {
     // 已经发出的 fetch 无法可靠撤销而不影响同页复用；迟到结果仅在落到当前严格
     // 窗口之外时回收。仍在 [cur-n, cur+n] 内的结果可供新窗口直接复用。
-    const radius = Math.max(1, Math.min(12, Math.trunc(Number(setting.prefetchCount) || 3)));
+    const radius = effectivePrefetchCount();
     if (idx < state.cur - radius || idx > state.cur + radius) evictDecoded(idx, rec);
   }
 
@@ -1561,7 +1942,7 @@ export function mountReader(root, photoId, query, options = {}) {
       const current = state.cur;
       const observed = filterReaderPrefetchWindow(entries.filter((entry) => entry.isIntersecting)
         .map((entry) => Number(entry.target.dataset.idx))
-        .filter((index) => Number.isInteger(index)), current, state.images.length, setting.prefetchCount);
+        .filter((index) => Number.isInteger(index)), current, state.images.length, effectivePrefetchCount(), 'forward');
       if (!observed.length) return;
       const generation = imageGeneration;
       const sourceVersion = imageSourceVersion;
@@ -1998,6 +2379,7 @@ export function mountReader(root, photoId, query, options = {}) {
           cover: state.cover,
           photoId: state.photoId,
           page: state.cur,
+          sourceIndex: currentSourceIndex(),
           total: state.images.length,
           offline,
         });
@@ -2018,6 +2400,7 @@ export function mountReader(root, photoId, query, options = {}) {
       aid: state.aid,
       photoId: state.photoId,
       page: state.cur,
+      sourceIndex: currentSourceIndex(),
       pageOffset: state.pageOffset,
       total: state.images.length,
       mode: state.mode,
@@ -2031,6 +2414,20 @@ export function mountReader(root, photoId, query, options = {}) {
     localStorage.setItem('jmw_reader_progress', JSON.stringify(all));
   }
 
+  function normalizeSavedRecord(rec) {
+    if (!rec || !state.images.length) return null;
+    const sourceIndex = Number(rec.sourceIndex);
+    if (Number.isInteger(sourceIndex) && sourceIndex >= 0 && sourceIndex < state.sourceImages.length) {
+      const visibleIndex = state.images.indexOf(state.sourceImages[sourceIndex]);
+      return {
+        ...rec,
+        page: visibleIndex >= 0 ? visibleIndex : 0,
+        pageOffset: visibleIndex >= 0 ? rec.pageOffset : 0,
+      };
+    }
+    return Number(rec.page) >= 0 && Number(rec.page) < state.images.length ? rec : null;
+  }
+
   function findSavedRec() {
     if (explicitStartPending) {
       explicitStartPending = false;
@@ -2042,7 +2439,8 @@ export function mountReader(root, photoId, query, options = {}) {
     try {
       const all = JSON.parse(localStorage.getItem('jmw_reader_progress') || '{}') || {};
       const rec = all[progressKey()];
-      if (rec && Number(rec.page) >= 0 && Number(rec.page) < state.images.length) return rec;
+      const normalized = normalizeSavedRecord(rec);
+      if (normalized) return normalized;
     } catch (_) {}
     if (!state.aid) return null;
     let list;
@@ -2052,8 +2450,7 @@ export function mountReader(root, photoId, query, options = {}) {
       return null;
     }
     const rec = list.find((it) => String(it.aid) === String(state.aid) && String(it.photoId) === String(state.photoId));
-    if (rec && Number(rec.page) >= 0 && Number(rec.page) < state.images.length) return rec;
-    return null;
+    return normalizeSavedRecord(rec);
   }
 
   let firstRender = true;

@@ -418,6 +418,11 @@ body.reading #main { padding: 0; }
   -webkit-overflow-scrolling: touch;
 }
 #reader .slot { position: relative; width: 100%; background: #101116; }
+#reader:not(.paged) .slot {
+  /* 长章节仍保留精确页位，但让浏览器跳过远离视口的绘制和样式计算。 */
+  content-visibility: auto;
+  contain-intrinsic-size: 900px;
+}
 #reader .slot img, #reader .slot canvas { width: 100%; height: auto; display: block; -webkit-user-drag: none; }
 #reader .slot .ph {
   width: 100%; display: flex; align-items: center; justify-content: center; color: #61636d; font-size: 13px;
