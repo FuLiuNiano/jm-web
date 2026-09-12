@@ -29,9 +29,6 @@ function deferred() {
     blobByteSize,
     recommendedDecodeConcurrency,
     recommendedPrefetchCount,
-    normalizeRecapSkipPages,
-    filterReaderImages,
-    detectRecapPageCount,
   } = await import(readerUrl);
   const descrambleUrl = pathToFileURL(path.resolve(__dirname, '..', 'public', 'js', 'descramble.js')).href;
   const { validateDecodeDimensions } = await import(descrambleUrl);
@@ -49,105 +46,6 @@ function deferred() {
   assert.strictEqual(recommendedPrefetchCount({ configured: 5, effectiveType: '2g' }), 1);
   assert.strictEqual(recommendedPrefetchCount({ configured: 5, deviceMemory: 2 }), 2);
   assert.strictEqual(recommendedPrefetchCount({ configured: 5, effectiveType: '4g' }), 5);
-  assert.strictEqual(normalizeRecapSkipPages(-3), 0);
-  assert.strictEqual(normalizeRecapSkipPages(99), 20);
-  const recapImages = [{ index: 0 }, { index: 1 }, { index: 2 }, { index: 3 }];
-  assert.deepStrictEqual(filterReaderImages(recapImages, 2), recapImages.slice(2));
-  assert.deepStrictEqual(filterReaderImages(recapImages, 99), [recapImages[3]], '至少保留一页');
-  assert.strictEqual(detectRecapPageCount(
-    [
-      { url: 'https://cdn-a.example/page-3.jpg?sig=1' },
-      { url: 'https://cdn-a.example/page-4.jpg' },
-      { url: 'https://cdn-a.example/page-5.jpg' },
-      { url: 'https://cdn-a.example/new.jpg' },
-    ],
-    [
-      { url: 'https://cdn-b.example/page-1.jpg' },
-      { url: 'https://cdn-b.example/page-3.jpg' },
-      { url: 'https://cdn-b.example/page-4.jpg?sig=2' },
-      { url: 'https://cdn-b.example/page-5.jpg' },
-    ],
-  ), 3, '不同 CDN 和签名参数仍应识别连续重复回顾');
-  assert.strictEqual(detectRecapPageCount(
-    [
-      { url: 'https://cdn-a.example/page-a.jpg' },
-      { url: 'https://cdn-a.example/inserted-cover.jpg' },
-      { url: 'https://cdn-a.example/page-b.jpg' },
-      { url: 'https://cdn-a.example/page-c.jpg' },
-      { url: 'https://cdn-a.example/new.jpg' },
-    ],
-    [
-      { url: 'https://cdn-b.example/old.jpg' },
-      { url: 'https://cdn-b.example/page-a.jpg' },
-      { url: 'https://cdn-b.example/page-b.jpg' },
-      { url: 'https://cdn-b.example/page-c.jpg' },
-    ],
-  ), 4, '回顾中间插入一张封面时仍应跳过完整回顾段');
-  assert.strictEqual(detectRecapPageCount(
-    [
-      { url: 'https://cdn-a.example/page-a.jpg' },
-      { url: 'https://cdn-a.example/page-b.jpg' },
-      { url: 'https://cdn-a.example/page-c.jpg' },
-      { url: 'https://cdn-a.example/new.jpg' },
-    ],
-    [
-      { url: 'https://cdn-b.example/old.jpg' },
-      { url: 'https://cdn-b.example/page-a.jpg' },
-      { url: 'https://cdn-b.example/page-b.jpg' },
-      { url: 'https://cdn-b.example/page-c.jpg' },
-      { url: 'https://cdn-b.example/ending-cover.jpg' },
-    ],
-  ), 3, '上一话末尾追加封面时仍应识别前面的回顾内容');
-  assert.strictEqual(detectRecapPageCount(
-    [
-      { url: 'https://cdn-a.example/cover-before.jpg' },
-      { url: 'https://cdn-a.example/page-a.jpg' },
-      { url: 'https://cdn-a.example/cover-between-a-b.jpg' },
-      { url: 'https://cdn-a.example/page-b.jpg' },
-      { url: 'https://cdn-a.example/cover-between-b-c.jpg' },
-      { url: 'https://cdn-a.example/page-c.jpg' },
-      { url: 'https://cdn-a.example/new.jpg' },
-    ],
-    [
-      { url: 'https://cdn-b.example/old.jpg' },
-      { url: 'https://cdn-b.example/page-a.jpg' },
-      { url: 'https://cdn-b.example/cover-between-a-b.jpg' },
-      { url: 'https://cdn-b.example/page-b.jpg' },
-      { url: 'https://cdn-b.example/cover-between-b-c.jpg' },
-      { url: 'https://cdn-b.example/page-c.jpg' },
-    ],
-  ), 6, '两章中间都存在插页时仍应按顺序识别回顾段');
-  assert.strictEqual(detectRecapPageCount(
-    [
-      { url: 'https://cdn-a.example/page-a.jpg' },
-      { url: 'https://cdn-a.example/cover-1.jpg' },
-      { url: 'https://cdn-a.example/cover-2.jpg' },
-      { url: 'https://cdn-a.example/cover-3.jpg' },
-      { url: 'https://cdn-a.example/page-b.jpg' },
-      { url: 'https://cdn-a.example/page-c.jpg' },
-      { url: 'https://cdn-a.example/new.jpg' },
-    ],
-    [
-      { url: 'https://cdn-b.example/old.jpg' },
-      { url: 'https://cdn-b.example/page-a.jpg' },
-      { url: 'https://cdn-b.example/page-b.jpg' },
-      { url: 'https://cdn-b.example/page-c.jpg' },
-    ],
-  ), 0, '间隔超过上限时不应误跳');
-  assert.strictEqual(detectRecapPageCount(
-    [{ url: 'https://cdn-a.example/page-3.jpg' }, { url: 'https://cdn-a.example/page-4.jpg' }, { url: 'https://cdn-a.example/new.jpg' }],
-    [{ url: 'https://cdn-b.example/page-3.jpg' }, { url: 'https://cdn-b.example/page-4.jpg' }],
-  ), 0, '两张通用封面不应自动判定为回顾');
-  assert.strictEqual(detectRecapPageCount(
-    [{ url: 'https://cdn-a.example/page-3.jpg' }, { url: 'https://cdn-a.example/page-4.jpg' }, { url: 'https://cdn-a.example/new.jpg' }],
-    [{ url: 'https://cdn-b.example/page-3.jpg' }, { url: 'https://cdn-b.example/page-4.jpg' }],
-    12,
-    2,
-  ), 2, '手动/兼容模式仍可识别两张重复页');
-  assert.strictEqual(detectRecapPageCount(
-    [{ url: 'https://cdn.example/only-one.jpg' }, { url: 'https://cdn.example/new.jpg' }],
-    [{ url: 'https://cdn.example/only-one.jpg' }],
-  ), 0, '只有一页重复时不自动判定为回顾');
   assert.throws(
     () => validateDecodeDimensions(4000, 10000),
     /图片过大/,

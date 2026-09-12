@@ -92,27 +92,6 @@ export function createReaderSettings(options) {
   );
   prefetchSelect.addEventListener('change', () => options.onSetting('prefetchCount', Number(prefetchSelect.value)));
 
-  const recapSkip = h('input', {
-    type: 'checkbox', class: 'r-switch', 'aria-label': '跳过开头回顾',
-  });
-  recapSkip.addEventListener('change', () => options.onSetting('recapSkipEnabled', recapSkip.checked));
-  const recapMaster = h('input', {
-    type: 'checkbox', class: 'r-switch', 'aria-label': '跳过片头回顾总开关',
-  });
-  recapMaster.addEventListener('change', () => options.onSetting(
-    'readerRecapMasterEnabled', recapMaster.checked,
-  ));
-  const recapAuto = h('input', {
-    type: 'checkbox', class: 'r-switch', 'aria-label': '自动识别重复回顾',
-  });
-  recapAuto.addEventListener('change', () => options.onSetting(
-    'readerRecapAutoEnabled', recapAuto.checked,
-  ));
-  const recapPages = h('select', { class: 'r-setting-select', 'aria-label': '跳过开头回顾页数' },
-    ...[1, 2, 3, 4, 5, 8, 10, 12, 15, 20].map((value) => h('option', { value: String(value) }, `${value} 页`)),
-  );
-  recapPages.addEventListener('change', () => options.onSetting('recapSkipPages', Number(recapPages.value)));
-
   const fitSelect = h('select', { class: 'r-setting-select', 'aria-label': '图片适配方式' },
     h('option', { value: 'contain' }, '完整显示'),
     h('option', { value: 'width' }, '适应宽度'),
@@ -243,16 +222,6 @@ export function createReaderSettings(options) {
           ),
           prefetchSelect,
         ),
-        switchRow('跳过片头回顾总开关', '关闭后自动和手动跳过都不生效，原来的手动设置会保留', recapMaster),
-        switchRow('自动识别重复回顾', '按顺序命中至少 3 页才自动跳过，允许中间或末尾有少量封面', recapAuto),
-        switchRow('跳过开头回顾', '手动指定回顾页数；关闭自动识别后仍可使用', recapSkip),
-        h('label', { class: 'r-setting-row' },
-          h('span', { class: 'r-setting-copy' },
-            h('span', { class: 'r-setting-label' }, '回顾页数'),
-            h('span', { class: 'r-setting-desc' }, '关闭后不会删除图片或离线缓存'),
-          ),
-          recapPages,
-        ),
         switchRow('内存优化', '限制同时解码数和缓存，适合内存较小的设备', memoryOpt),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
@@ -291,15 +260,6 @@ export function createReaderSettings(options) {
     shuntSelect.disabled = s.offline === true || s.sourceRefreshPending === true || !s.sourceReady;
     prefetchSelect.value = ['1', '2', '3', '5', '8'].includes(String(s.prefetchCount))
       ? String(s.prefetchCount) : '3';
-    recapSkip.checked = s.recapSkipEnabled === true;
-    recapMaster.checked = s.readerRecapMasterEnabled !== false;
-    recapAuto.checked = s.readerRecapAutoEnabled !== false;
-    recapMaster.disabled = s.recapAvailable === false;
-    recapSkip.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
-    recapAuto.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
-    recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12', '15', '20'].includes(String(s.recapSkipPages))
-      ? String(s.recapSkipPages) : '1';
-    recapPages.disabled = !recapSkip.checked || s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     followBrightness.checked = s.brightnessFollowSystem !== false;
     brightness.value = String(Math.round(clamp(s.brightness ?? 1, .2, 1) * 100));
     brightness.disabled = followBrightness.checked;

@@ -16,11 +16,6 @@ const RAW_CACHE_DEFAULT_BYTES = 64 * MIB;
 const RAW_CACHE_MEMORY_OPT_BYTES = 32 * MIB;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
-const RECAP_AUTO_MIN_MATCH_PAGES = 3;
-const RECAP_FINGERPRINT_PAGE_LIMIT = 20;
-const RECAP_FINGERPRINT_MAX_BYTES = 4 * MIB;
-const RECAP_AUTO_MAX_GAP_PAGES = 2;
-const RECAP_FINGERPRINT_CONCURRENCY = 4;
 const READER_IMAGE_AUTO_RETRIES = 3;
 
 /**
@@ -72,234 +67,6 @@ export function recommendedPrefetchCount({ configured = 3, deviceMemory, effecti
   return count;
 }
 
-/** 规范化“每章开头跳过回顾页数”，最多保留 20 页的安全上限。 */
-export function normalizeRecapSkipPages(value) {
-  return Math.max(0, Math.min(20, Math.trunc(Number(value) || 0)));
-}
-
-/**
- * 只在阅读器视图中跳过开头页，保留原数组对象和离线 index，方便关闭设置后恢复。
- * 至少保留一页，避免误设页数后把章节变成空章节。
- */
-export function filterReaderImages(images, skipPages = 0) {
-  if (!Array.isArray(images)) return [];
-  const skip = Math.min(normalizeRecapSkipPages(skipPages), Math.max(0, images.length - 1));
-  return images.slice(skip);
-}
-
-function imageIdentity(value) {
-  const raw = typeof value === 'object' && value !== null
-    ? (value.url || value.name || value.page) : value;
-  const text = String(raw || '').trim();
-  if (!text) return '';
-  try {
-    const parsed = new URL(text);
-    // 不比较 CDN 域名和临时签名参数；同一张图片切换线路后仍应能识别。
-    return parsed.pathname.toLowerCase();
-  } catch (_) {
-    return text.split(/[?#]/, 1)[0].toLowerCase();
-  }
-}
-
-/**
- * 查找“当前章节开头”和“上一章节结尾”的有序重复段。允许当前/上一章的
- * 重复段中间出现少量插页（常见是封面），但要求当前开头和上一话末尾附近
- * 的锚点成立、每个间隔不超过上限，并且至少命中多页，避免普通公共封面触发自动跳过。
- */
-function detectRecapSequence(currentTokens, previousTokens, {
-  minMatches = RECAP_AUTO_MIN_MATCH_PAGES,
-  maxGap = RECAP_AUTO_MAX_GAP_PAGES,
-  maxLeadingCurrentGap = RECAP_AUTO_MAX_GAP_PAGES,
-  maxTrailingPreviousGap = RECAP_AUTO_MAX_GAP_PAGES,
-  matchTokens = (left, right) => left === right,
-} = {}) {
-  if (!Array.isArray(currentTokens) || !Array.isArray(previousTokens)) return 0;
-  const minimum = Math.max(1, Math.min(20, Math.trunc(Number(minMatches) || RECAP_AUTO_MIN_MATCH_PAGES)));
-  const gapLimit = Math.max(0, Math.min(4, Math.trunc(Number(maxGap) || 0)));
-  const leadingLimit = Math.max(0, Math.min(4,
-    Math.trunc(Number(maxLeadingCurrentGap) || 0)));
-  const trailingLimit = Math.max(0, Math.min(4,
-    Math.trunc(Number(maxTrailingPreviousGap) || 0)));
-  const chains = [];
-  let winner = null;
-  const betterChain = (left, right) => {
-    if (!right) return true;
-    if (left.matches !== right.matches) return left.matches > right.matches;
-    if (left.gaps !== right.gaps) return left.gaps < right.gaps;
-    return left.endCurrent > right.endCurrent;
-  };
-  for (let currentIndex = 0; currentIndex < currentTokens.length; currentIndex++) {
-    const current = String(currentTokens[currentIndex] || '');
-    if (!current) continue;
-    for (let previousIndex = 0; previousIndex < previousTokens.length; previousIndex++) {
-      const previous = String(previousTokens[previousIndex] || '');
-      if (!previous || !matchTokens(current, previous)) continue;
-      let best = null;
-      if (currentIndex <= leadingLimit) {
-        best = {
-          matches: 1,
-          gaps: currentIndex,
-          startCurrent: currentIndex,
-          endCurrent: currentIndex,
-          endPrevious: previousIndex,
-        };
-      }
-      for (const chain of chains) {
-        if (chain.endCurrent >= currentIndex || chain.endPrevious >= previousIndex) continue;
-        if (currentIndex - chain.endCurrent - 1 > gapLimit
-            || previousIndex - chain.endPrevious - 1 > gapLimit) continue;
-        const candidate = {
-          matches: chain.matches + 1,
-          gaps: chain.gaps + (currentIndex - chain.endCurrent - 1)
-            + (previousIndex - chain.endPrevious - 1),
-          startCurrent: chain.startCurrent,
-          endCurrent: currentIndex,
-          endPrevious: previousIndex,
-        };
-        if (betterChain(candidate, best)) best = candidate;
-      }
-      if (!best) continue;
-      chains.push(best);
-      const trailingGap = previousTokens.length - 1 - best.endPrevious;
-      if (trailingGap >= 0 && trailingGap <= trailingLimit && best.matches >= minimum
-          && best.startCurrent <= leadingLimit && betterChain(best, winner)) winner = best;
-    }
-  }
-  return winner ? winner.endCurrent + 1 : 0;
-}
-
-/**
- * 通过“上一话末尾页 = 本话开头页”识别重复回顾。允许重复段中间插入少量
- * 封面页，但自动识别仍要求至少命中 3 页；手动设置仍可指定 1、2 页。
- */
-export function detectRecapPageCount(
-  currentImages, previousImages, maxPages = 12, minPages = RECAP_AUTO_MIN_MATCH_PAGES,
-) {
-  if (!Array.isArray(currentImages) || !Array.isArray(previousImages)
-      || currentImages.length < 2 || !previousImages.length) return 0;
-  const matchLimit = Math.max(0, Math.trunc(Number(maxPages) || 12));
-  const previousLimit = Math.min(matchLimit, previousImages.length);
-  const currentLimit = Math.min(
-    currentImages.length - 1,
-    matchLimit + RECAP_AUTO_MAX_GAP_PAGES * Math.max(0, matchLimit - 1)
-      + RECAP_AUTO_MAX_GAP_PAGES,
-  );
-  if (previousLimit < 1 || currentLimit < 1) return 0;
-  return detectRecapSequence(
-    currentImages.slice(0, currentLimit).map(imageIdentity),
-    previousImages.slice(-previousLimit).map(imageIdentity),
-    { minMatches: minPages },
-  );
-}
-
-async function imageBitmapFromBlob(blob) {
-  if (typeof createImageBitmap === 'function') {
-    try { return await createImageBitmap(blob); } catch (_) {}
-  }
-  if (typeof Image === 'undefined' || typeof globalThis.URL?.createObjectURL !== 'function') return null;
-  const objectUrl = globalThis.URL.createObjectURL(blob);
-  try {
-    const image = await new Promise((resolve, reject) => {
-      const element = new Image();
-      element.onload = () => resolve(element);
-      element.onerror = () => reject(new Error('图片视觉指纹解码失败'));
-      element.src = objectUrl;
-    });
-    image.close = () => globalThis.URL.revokeObjectURL(objectUrl);
-    return image;
-  } catch (_) {
-    globalThis.URL.revokeObjectURL(objectUrl);
-    return null;
-  }
-}
-
-async function visualFingerprint(blob) {
-  if (!(blob instanceof Blob) || !blob.size) return '';
-  const bitmap = await imageBitmapFromBlob(blob);
-  if (!bitmap || !bitmap.width || !bitmap.height) return '';
-  const width = 16;
-  const height = 24;
-  const canvas = typeof OffscreenCanvas === 'function'
-    ? new OffscreenCanvas(width, height) : document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) {
-    bitmap.close?.();
-    return '';
-  }
-  try {
-    context.drawImage(bitmap, 0, 0, width, height);
-    const pixels = context.getImageData(0, 0, width, height).data;
-    const gray = [];
-    let total = 0;
-    for (let index = 0; index < pixels.length; index += 4) {
-      const value = Math.round(pixels[index] * .299 + pixels[index + 1] * .587 + pixels[index + 2] * .114);
-      gray.push(value);
-      total += value;
-    }
-    const average = total / gray.length;
-    // 384 个二值采样点足以区分连续回顾页，又对压缩/尺寸变化稳定。
-    return `v1:${width}x${height}:${gray.map((value) => value >= average ? '1' : '0').join('')}`;
-  } catch (_) {
-    return '';
-  } finally {
-    bitmap.close?.();
-    try { canvas.width = 1; canvas.height = 1; } catch (_) {}
-  }
-}
-
-/**
- * 同一画面经过不同 CDN 压缩、尺寸缩放或解扰编码后，少量采样点可能翻转；
- * 允许有限汉明距离，避免把“同一张回顾图”误判为完全不同。
- */
-function visualFingerprintsMatch(left, right) {
-  if (!left || !right) return false;
-  if (left === right) return true;
-  const leftMatch = /^v1:(\d+x\d+):([01]+)$/.exec(left);
-  const rightMatch = /^v1:(\d+x\d+):([01]+)$/.exec(right);
-  if (!leftMatch || !rightMatch || leftMatch[1] !== rightMatch[1]
-      || leftMatch[2].length !== rightMatch[2].length) return false;
-  let differences = 0;
-  for (let index = 0; index < leftMatch[2].length; index++) {
-    if (leftMatch[2][index] !== rightMatch[2][index]) differences++;
-  }
-  return differences <= Math.max(8, Math.ceil(leftMatch[2].length * .12));
-}
-
-async function fingerprintImage(item, signal, chapterMeta = {}) {
-  const source = typeof item?.url === 'string' ? item.url.trim() : '';
-  if (!source) return '';
-  const requestUrl = chapterImgSrc(source);
-  if (!requestUrl) return '';
-  try {
-    const response = await fetch(requestUrl, {
-      headers: { 'X-JMW-Data-Source': selectedDataSource() },
-      credentials: 'same-origin',
-      cache: 'default',
-      priority: 'low',
-      signal,
-    });
-    if (!response.ok) return '';
-    const declared = Number(response.headers?.get('content-length'));
-    if (Number.isFinite(declared) && declared > RECAP_FINGERPRINT_MAX_BYTES) return '';
-    const rawBlob = await response.blob();
-    if (!rawBlob.size || rawBlob.size > RECAP_FINGERPRINT_MAX_BYTES) return '';
-    const scrambleId = Number(chapterMeta.scrambleId || 0);
-    const photoId = Number(chapterMeta.photoId || 0);
-    const speed = String(chapterMeta.speed || '');
-    const displayBlob = needsScramble({
-      photoId, scrambleId, speed, name: String(item.name || ''),
-    })
-      ? (await decodeFromBlob(rawBlob, photoId, item.page, { signal })).blob
-      : rawBlob;
-    return await visualFingerprint(displayBlob);
-  } catch (error) {
-    if (error?.name === 'AbortError') throw error;
-    return '';
-  }
-}
-
 export function normalizeChapterImages(value) {
   if (!Array.isArray(value)) return [];
   const images = [];
@@ -322,20 +89,12 @@ export function normalizeChapterImages(value) {
 
 export function normalizeReaderSeries(value) {
   if (!Array.isArray(value)) return [];
-  return value.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
-    .map((item) => {
-      const id = item.id ?? item.photoId ?? item.photo_id ?? item.chapter_id;
-      return {
-        id: String(id ?? ''),
-        name: String(item.name || item.title || '').trim(),
-        sortValue: item.sort ?? item.order ?? item.index,
-      };
-    })
-    .filter((item) => /^\d+$/.test(item.id))
+  return value.filter((item) => item && typeof item === 'object'
+    && /^\d+$/.test(String(item.id || '')))
     .map((item, index) => ({
-      id: item.id,
-      name: item.name,
-      sort: Number.isFinite(Number(item.sortValue)) ? Number(item.sortValue) : index,
+      id: String(item.id),
+      name: String(item.name || '').trim(),
+      sort: Number(item.sort) || index,
     }));
 }
 
@@ -442,10 +201,7 @@ export function mountReader(root, photoId, query, options = {}) {
     cover: null,
     chapters: [], // [{id, name}]
     curChapterIdx: -1,
-    sourceImages: [], // 章节原始图片；state.images 可能按设置隐藏开头回顾页
     images: [],
-    recapSkipPages: 0,
-    recapAutoSkipPages: 0,
     scrambleId: 0,
     speed: '',
     mode: savedMode,
@@ -487,8 +243,6 @@ export function mountReader(root, photoId, query, options = {}) {
   let wakeLock = null;
   let explicitStartPending = requestedPage != null;
   const deviceMemory = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
-  let recapDetectionSeq = 0;
-  const recapFingerprintCache = new Map();
   const imageRetryAttempts = new Map();
   let continuousPrefetchSeq = 0;
   let continuousPrefetchRunning = false;
@@ -507,63 +261,17 @@ export function mountReader(root, photoId, query, options = {}) {
     continuousPrefetchSeq++;
   }
 
-  function recapSettingKey() {
-    const raw = String(state.aid || '').trim();
-    if (/^[\w:-]{1,80}$/.test(raw)) return raw;
-    return `chapter:${String(state.photoId || '').replace(/[^\w-]/g, '').slice(0, 40)}`;
-  }
-
-  function storedRecapSkipPages() {
-    const map = setting.readerRecapPagesByComic;
-    if (!map || typeof map !== 'object' || Array.isArray(map)) return 0;
-    return normalizeRecapSkipPages(map[recapSettingKey()]);
-  }
-
-  function recapMasterEnabled() {
-    return setting.readerRecapMasterEnabled !== false;
-  }
-
-  function configuredRecapSkipPages() {
-    if (!recapMasterEnabled()) return 0;
-    const manual = storedRecapSkipPages();
-    if (manual > 0) return manual;
-    return setting.readerRecapAutoEnabled !== false ? state.recapAutoSkipPages : 0;
-  }
-
   function setSourceImages(images) {
     const previousImage = state.images[state.cur];
-    state.sourceImages = Array.isArray(images) ? images : [];
+    state.images = Array.isArray(images) ? images : [];
     imageRetryAttempts.clear();
-    state.recapSkipPages = Math.min(
-      configuredRecapSkipPages(),
-      Math.max(0, state.sourceImages.length - 1),
-    );
-    state.images = filterReaderImages(state.sourceImages, state.recapSkipPages);
     const preservedIndex = previousImage ? state.images.indexOf(previousImage) : -1;
     if (preservedIndex >= 0) state.cur = preservedIndex;
     else state.cur = Math.min(Math.max(0, state.cur), Math.max(0, state.images.length - 1));
   }
 
-  function persistRecapSkipPages(pages) {
-    const current = setting.readerRecapPagesByComic;
-    const next = {};
-    if (current && typeof current === 'object' && !Array.isArray(current)) {
-      for (const [key, value] of Object.entries(current).slice(-300)) {
-        if (!/^[\w:-]{1,80}$/.test(key)) continue;
-        const safe = normalizeRecapSkipPages(value);
-        if (safe > 0) next[key] = safe;
-      }
-    }
-    const safePages = normalizeRecapSkipPages(pages);
-    if (safePages > 0) next[recapSettingKey()] = safePages;
-    else delete next[recapSettingKey()];
-    updateSetting({ readerRecapPagesByComic: next });
-  }
-
   function currentSourceIndex() {
-    const image = state.images[state.cur];
-    const index = image ? state.sourceImages.indexOf(image) : -1;
-    return index >= 0 ? index : state.cur + state.recapSkipPages;
+    return state.cur;
   }
 
   function effectivePrefetchCount() {
@@ -588,123 +296,6 @@ export function mountReader(root, photoId, query, options = {}) {
     state.dims.clear();
     for (const url of retiredObjectUrls) revokeReaderObjectUrl(url);
     retiredObjectUrls.clear();
-  }
-
-  async function previousChapterImages(chapter) {
-    if (!chapter?.id) return { images: [], photoId: '', scrambleId: 0, speed: '' };
-    if (!offline) {
-      const data = await readerRequest(`/chapter?id=${encodeURIComponent(chapter.id)}&shunt=${encodeURIComponent(activeImageShunt)}`);
-      const payload = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
-        ? data.data : {};
-      return {
-        images: normalizeChapterImages(payload.images),
-        photoId: String(chapter.id),
-        scrambleId: Number(payload.scrambleId || 0),
-        speed: String(payload.speed || ''),
-      };
-    }
-    const [rows, metadata] = await Promise.all([
-      listOfflineImages(state.aid, chapter.id, { includeBlob: false }),
-      getOfflineChapter(state.aid, chapter.id),
-    ]);
-    return {
-      images: Array.isArray(rows) ? rows.slice().sort((a, b) => Number(a?.index) - Number(b?.index)) : [],
-      photoId: String(chapter.id),
-      scrambleId: Number(metadata?.scrambleId || 0),
-      speed: String(metadata?.speed || ''),
-    };
-  }
-
-  async function cachedRecapFingerprint(image, chapterMeta) {
-    const key = typeof image?.url === 'string' ? image.url : '';
-    if (!key) return '';
-    const cacheKey = `${key}|${chapterMeta.photoId}|${chapterMeta.scrambleId}|${chapterMeta.speed}`;
-    if (recapFingerprintCache.has(cacheKey)) return recapFingerprintCache.get(cacheKey);
-    const fingerprint = await fingerprintImage(image, signal, chapterMeta);
-    if (fingerprint) {
-      recapFingerprintCache.set(cacheKey, fingerprint);
-      while (recapFingerprintCache.size > 48) {
-        recapFingerprintCache.delete(recapFingerprintCache.keys().next().value);
-      }
-    }
-    return fingerprint;
-  }
-
-  /**
-   * URL 可能因章节 ID、CDN 或签名参数不同而变化，因此在 URL 匹配失败后，
-   * 在后台扫描两端最多 20 个匹配页及其插页窗口。最多 4 个低优先级任务并发，
-   * 不阻塞首图，也不会把图片常驻内存；只缓存短字符串指纹。
-   */
-  async function detectRecapPageCountByContent(currentImages, previousChapter) {
-    const previousImages = Array.isArray(previousChapter?.images) ? previousChapter.images : [];
-    const matchLimit = Math.min(
-      RECAP_FINGERPRINT_PAGE_LIMIT,
-      previousImages.length,
-    );
-    const currentLimit = Math.min(
-      currentImages.length - 1,
-      matchLimit + RECAP_AUTO_MAX_GAP_PAGES * Math.max(0, matchLimit - 1)
-        + RECAP_AUTO_MAX_GAP_PAGES,
-    );
-    if (matchLimit < RECAP_AUTO_MIN_MATCH_PAGES || currentLimit < 1) return 0;
-    const currentFingerprints = new Map();
-    const previousFingerprints = new Map();
-    const previousStart = previousImages.length - matchLimit;
-    const jobs = [];
-    for (let index = 0; index < currentLimit; index++) jobs.push({ type: 'current', index });
-    for (let index = previousStart; index < previousImages.length; index++) {
-      jobs.push({ type: 'previous', index });
-    }
-    let nextJob = 0;
-    const runFingerprintWorker = async () => {
-      while (nextJob < jobs.length) {
-        const job = jobs[nextJob++];
-        const fingerprint = job.type === 'current'
-          ? await cachedRecapFingerprint(currentImages[job.index], {
-            photoId: state.photoId, scrambleId: state.scrambleId, speed: state.speed,
-          })
-          : await cachedRecapFingerprint(previousImages[job.index], previousChapter);
-        if (job.type === 'current') currentFingerprints.set(job.index, fingerprint);
-        else previousFingerprints.set(job.index, fingerprint);
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(RECAP_FINGERPRINT_CONCURRENCY, jobs.length) },
-      () => runFingerprintWorker()));
-    const currentTokens = Array.from({ length: currentLimit }, (_, index) => (
-      currentFingerprints.get(index) || ''
-    ));
-    const previousTokens = Array.from({ length: matchLimit }, (_, index) => (
-      previousFingerprints.get(previousStart + index) || ''
-    ));
-    return detectRecapSequence(currentTokens, previousTokens, {
-      matchTokens: visualFingerprintsMatch,
-    });
-  }
-
-  async function detectRecapInBackground() {
-    if (state.destroyed || signal.aborted || !recapMasterEnabled() || setting.readerRecapAutoEnabled === false
-        || storedRecapSkipPages() > 0 || state.curChapterIdx <= 0 || !state.sourceImages.length) return;
-    const previous = state.chapters[state.curChapterIdx - 1];
-    if (!previous?.id) return;
-    const seq = ++recapDetectionSeq;
-    try {
-      const previousChapterData = await previousChapterImages(previous);
-      const images = previousChapterData.images;
-      if (state.destroyed || signal.aborted || seq !== recapDetectionSeq || !recapMasterEnabled()
-          || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
-      const pages = detectRecapPageCount(state.sourceImages, images, RECAP_FINGERPRINT_PAGE_LIMIT)
-        || await detectRecapPageCountByContent(state.sourceImages, previousChapterData);
-      if (!pages || pages === state.recapAutoSkipPages) return;
-      const oldPages = state.recapSkipPages;
-      state.recapAutoSkipPages = pages;
-      setSourceImages(state.sourceImages);
-      if (state.recapSkipPages === oldPages) return;
-      resetDecodedAfterImageListChange();
-      render();
-      showHint(`已自动识别并跳过上一话回顾 ${state.recapSkipPages} 页`);
-    } catch (_) {
-      // 回顾识别是后台增强功能；上一话请求失败时不影响当前章节阅读。
-    }
   }
 
   function rawCacheLimitBytes() {
@@ -1010,11 +601,6 @@ export function mountReader(root, photoId, query, options = {}) {
       zoom: state.zoom,
       current: state.cur,
       total: state.images.length,
-      recapAvailable: state.sourceImages.length > 1,
-      readerRecapMasterEnabled: recapMasterEnabled(),
-      readerRecapAutoEnabled: setting.readerRecapAutoEnabled !== false,
-      recapSkipEnabled: state.recapSkipPages > 0,
-      recapSkipPages: state.recapSkipPages || 1,
       hasPreviousChapter: state.curChapterIdx > 0,
       hasNextChapter: state.curChapterIdx >= 0 && state.curChapterIdx < state.chapters.length - 1,
     };
@@ -1039,49 +625,6 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function changeReaderSetting(key, value) {
     if (state.destroyed) return;
-    if (key === 'readerRecapMasterEnabled') {
-      value = value === true;
-      const previous = recapMasterEnabled();
-      updateSetting({ readerRecapMasterEnabled: value });
-      if (previous !== value && state.sourceImages.length) {
-        setSourceImages(state.sourceImages);
-        resetDecodedAfterImageListChange();
-        render();
-        if (value === true) detectRecapInBackground();
-        showHint(value ? '已开启片头回顾跳过' : '已关闭片头回顾跳过');
-      }
-      applyReaderSettings();
-      return;
-    }
-    if (key === 'readerRecapAutoEnabled') {
-      value = value === true;
-      const previous = setting.readerRecapAutoEnabled !== false;
-      updateSetting({ readerRecapAutoEnabled: value });
-      if (previous !== value && state.sourceImages.length) {
-        setSourceImages(state.sourceImages);
-        resetDecodedAfterImageListChange();
-        render();
-        if (value === true) detectRecapInBackground();
-        showHint(value ? '已开启自动识别重复回顾' : '已关闭自动识别，请使用手动页数');
-      }
-      applyReaderSettings();
-      return;
-    }
-    if (key === 'recapSkipEnabled' || key === 'recapSkipPages') {
-      const previous = state.recapSkipPages;
-      let pages = key === 'recapSkipPages' ? normalizeRecapSkipPages(value) : previous || 1;
-      if (key === 'recapSkipEnabled' && value !== true) pages = 0;
-      if (key === 'recapSkipEnabled' && value !== true) state.recapAutoSkipPages = 0;
-      persistRecapSkipPages(pages);
-      setSourceImages(state.sourceImages);
-      if (pages !== previous) {
-        resetDecodedAfterImageListChange();
-        render();
-        if (state.recapSkipPages > 0) showHint(`已跳过开头 ${state.recapSkipPages} 页`);
-      }
-      applyReaderSettings();
-      return;
-    }
     if (key === 'theme' && !['auto', 'light', 'dark'].includes(value)) return;
     if (key === 'shunt') {
       value = String(value);
@@ -1428,13 +971,12 @@ export function mountReader(root, photoId, query, options = {}) {
         container.querySelector('.r-loading')?.remove();
         titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
         render();
-        detectRecapInBackground();
       } catch (e) {
         if (!state.destroyed) showFatal(e.message || '无法打开离线章节');
       }
       return;
     }
-    let albumPromise = state.aid
+    const albumPromise = state.aid
       ? readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null)
       : Promise.resolve(null);
     // 与章节/详情并行读取能力配置；翻译关闭时阅读器不应逐页发送 503 探测请求。
@@ -1460,12 +1002,6 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return;
     const d = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
       ? data.data : {};
-    // 直链、历史记录或外部分享有时没有带 aid；章节 HTML 自带的 aid 仍可
-    // 用于补齐作品目录，否则阅读器无法定位上一话，自动回顾识别不会触发。
-    if (!state.aid && /^\d{1,16}$/.test(String(d.aid || ''))) {
-      state.aid = String(d.aid);
-      albumPromise = readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null);
-    }
     setSourceImages(normalizeChapterImages(d.images));
     if (!state.images.length) {
       showFatal('章节没有返回可读取的安全图片，请稍后重试或切换线路');
@@ -1491,9 +1027,7 @@ export function mountReader(root, photoId, query, options = {}) {
         cover_url: album.data.cover_url,
         coverUrl: album.data.coverUrl,
       });
-      const series = normalizeReaderSeries(
-        Array.isArray(album.data.series) ? album.data.series : album.data.chapters,
-      );
+      const series = normalizeReaderSeries(album.data.series);
       if (series.length > 1 || (series.length === 1 && album.data.series_id && album.data.series_id !== '0')) {
         series.sort((a, b) => a.sort - b.sort);
         state.chapters = series;
@@ -1515,7 +1049,6 @@ export function mountReader(root, photoId, query, options = {}) {
 
     titleEl.textContent = state.albumName || currentChapterName() || `章节 ${state.photoId}`;
     render();
-    detectRecapInBackground();
   }
 
   function showFatal(msg) {
@@ -2791,12 +2324,10 @@ export function mountReader(root, photoId, query, options = {}) {
   function normalizeSavedRecord(rec) {
     if (!rec || !state.images.length) return null;
     const sourceIndex = Number(rec.sourceIndex);
-    if (Number.isInteger(sourceIndex) && sourceIndex >= 0 && sourceIndex < state.sourceImages.length) {
-      const visibleIndex = state.images.indexOf(state.sourceImages[sourceIndex]);
+    if (Number.isInteger(sourceIndex) && sourceIndex >= 0 && sourceIndex < state.images.length) {
       return {
         ...rec,
-        page: visibleIndex >= 0 ? visibleIndex : 0,
-        pageOffset: visibleIndex >= 0 ? rec.pageOffset : 0,
+        page: sourceIndex,
       };
     }
     return Number(rec.page) >= 0 && Number(rec.page) < state.images.length ? rec : null;

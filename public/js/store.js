@@ -20,9 +20,6 @@ const defaultSetting = {
   prefetchCount: 3,     // 预加载数量
   readerContinuousPrefetchEnabled: true, // 按章节顺序在后台持续预缓存后续图片
   readerTranslationEnabled: false, // 阅读器翻译默认关闭，避免翻译服务阻塞首图
-  readerRecapMasterEnabled: true, // 片头回顾跳过总开关；关闭时保留下方手动设置但不生效
-  readerRecapAutoEnabled: true, // 后台比对上一话末尾与本话开头，自动跳过重复回顾
-  readerRecapPagesByComic: {}, // 漫画 ID -> 每章开头跳过页数；不删除原始/离线图片
   brightnessFollowSystem: true,
   brightness: 1,
   showPageNumber: true,
