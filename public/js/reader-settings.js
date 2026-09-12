@@ -244,7 +244,7 @@ export function createReaderSettings(options) {
           prefetchSelect,
         ),
         switchRow('跳过片头回顾总开关', '关闭后自动和手动跳过都不生效，原来的手动设置会保留', recapMaster),
-        switchRow('自动识别重复回顾', '至少连续 3 页内容一致才自动跳过；封面重复时可关闭', recapAuto),
+        switchRow('自动识别重复回顾', '按顺序命中至少 3 页才自动跳过，允许中间插入少量封面', recapAuto),
         switchRow('跳过开头回顾', '手动指定回顾页数；关闭自动识别后仍可使用', recapSkip),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },

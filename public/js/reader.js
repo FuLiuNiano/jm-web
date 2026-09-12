@@ -19,6 +19,7 @@ const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image
 const RECAP_AUTO_MIN_MATCH_PAGES = 3;
 const RECAP_FINGERPRINT_PAGE_LIMIT = 20;
 const RECAP_FINGERPRINT_MAX_BYTES = 4 * MIB;
+const RECAP_AUTO_MAX_GAP_PAGES = 2;
 const READER_IMAGE_AUTO_RETRIES = 3;
 
 /**
@@ -100,34 +101,92 @@ function imageIdentity(value) {
 }
 
 /**
- * 通过“上一话末尾页 = 本话开头页”识别重复回顾。自动识别默认要求至少连续
- * 3 页，单张/两张通用封面不会再被当成回顾；手动设置仍可指定 1、2 页。
+ * 查找“当前章节开头”和“上一章节结尾”的有序重复段。允许当前/上一章的
+ * 重复段中间出现少量插页（常见是封面），但要求首尾锚点成立、每个间隔不
+ * 超过上限，并且至少命中多页，避免普通公共封面触发自动跳过。
+ */
+function detectRecapSequence(currentTokens, previousTokens, {
+  minMatches = RECAP_AUTO_MIN_MATCH_PAGES,
+  maxGap = RECAP_AUTO_MAX_GAP_PAGES,
+  maxLeadingCurrentGap = RECAP_AUTO_MAX_GAP_PAGES,
+} = {}) {
+  if (!Array.isArray(currentTokens) || !Array.isArray(previousTokens)) return 0;
+  const minimum = Math.max(1, Math.min(20, Math.trunc(Number(minMatches) || RECAP_AUTO_MIN_MATCH_PAGES)));
+  const gapLimit = Math.max(0, Math.min(4, Math.trunc(Number(maxGap) || 0)));
+  const leadingLimit = Math.max(0, Math.min(4,
+    Math.trunc(Number(maxLeadingCurrentGap) || 0)));
+  const chains = [];
+  let winner = null;
+  const betterChain = (left, right) => {
+    if (!right) return true;
+    if (left.matches !== right.matches) return left.matches > right.matches;
+    if (left.gaps !== right.gaps) return left.gaps < right.gaps;
+    return left.endCurrent > right.endCurrent;
+  };
+  for (let currentIndex = 0; currentIndex < currentTokens.length; currentIndex++) {
+    const current = String(currentTokens[currentIndex] || '');
+    if (!current) continue;
+    for (let previousIndex = 0; previousIndex < previousTokens.length; previousIndex++) {
+      if (current !== String(previousTokens[previousIndex] || '')) continue;
+      let best = null;
+      if (currentIndex <= leadingLimit) {
+        best = {
+          matches: 1,
+          gaps: currentIndex,
+          startCurrent: currentIndex,
+          endCurrent: currentIndex,
+          endPrevious: previousIndex,
+          previous: null,
+        };
+      }
+      for (const chain of chains) {
+        if (chain.endCurrent >= currentIndex || chain.endPrevious >= previousIndex) continue;
+        if (currentIndex - chain.endCurrent - 1 > gapLimit
+            || previousIndex - chain.endPrevious - 1 > gapLimit) continue;
+        const candidate = {
+          matches: chain.matches + 1,
+          gaps: chain.gaps + (currentIndex - chain.endCurrent - 1)
+            + (previousIndex - chain.endPrevious - 1),
+          startCurrent: chain.startCurrent,
+          endCurrent: currentIndex,
+          endPrevious: previousIndex,
+          previous: chain,
+        };
+        if (betterChain(candidate, best)) best = candidate;
+      }
+      if (!best) continue;
+      chains.push(best);
+      if (best.endPrevious === previousTokens.length - 1 && best.matches >= minimum
+          && best.startCurrent <= leadingLimit) {
+        if (betterChain(best, winner)) winner = best;
+      }
+    }
+  }
+  return winner ? winner.endCurrent + 1 : 0;
+}
+
+/**
+ * 通过“上一话末尾页 = 本话开头页”识别重复回顾。允许重复段中间插入少量
+ * 封面页，但自动识别仍要求至少命中 3 页；手动设置仍可指定 1、2 页。
  */
 export function detectRecapPageCount(
   currentImages, previousImages, maxPages = 12, minPages = RECAP_AUTO_MIN_MATCH_PAGES,
 ) {
   if (!Array.isArray(currentImages) || !Array.isArray(previousImages)
       || currentImages.length < 2 || !previousImages.length) return 0;
-  const minimum = Math.max(1, Math.min(20, Math.trunc(Number(minPages) || RECAP_AUTO_MIN_MATCH_PAGES)));
-  const limit = Math.min(
-    Math.max(0, Math.trunc(Number(maxPages) || 12)),
+  const matchLimit = Math.max(0, Math.trunc(Number(maxPages) || 12));
+  const previousLimit = Math.min(matchLimit, previousImages.length);
+  const currentLimit = Math.min(
     currentImages.length - 1,
-    previousImages.length,
+    matchLimit + RECAP_AUTO_MAX_GAP_PAGES * Math.max(0, matchLimit - 1)
+      + RECAP_AUTO_MAX_GAP_PAGES,
   );
-  for (let count = limit; count >= minimum; count--) {
-    const previousStart = previousImages.length - count;
-    let same = true;
-    for (let index = 0; index < count; index++) {
-      const current = imageIdentity(currentImages[index]);
-      const previous = imageIdentity(previousImages[previousStart + index]);
-      if (!current || current !== previous) {
-        same = false;
-        break;
-      }
-    }
-    if (same) return count;
-  }
-  return 0;
+  if (previousLimit < 1 || currentLimit < 1) return 0;
+  return detectRecapSequence(
+    currentImages.slice(0, currentLimit).map(imageIdentity),
+    previousImages.slice(-previousLimit).map(imageIdentity),
+    { minMatches: minPages },
+  );
 }
 
 async function imageBitmapFromBlob(blob) {
@@ -548,39 +607,41 @@ export function mountReader(root, photoId, query, options = {}) {
    */
   async function detectRecapPageCountByContent(currentImages, previousChapter) {
     const previousImages = Array.isArray(previousChapter?.images) ? previousChapter.images : [];
-    const limit = Math.min(
+    const matchLimit = Math.min(
       RECAP_FINGERPRINT_PAGE_LIMIT,
-      currentImages.length - 1,
       previousImages.length,
     );
-    if (limit < RECAP_AUTO_MIN_MATCH_PAGES) return 0;
+    const currentLimit = Math.min(
+      currentImages.length - 1,
+      matchLimit + RECAP_AUTO_MAX_GAP_PAGES * Math.max(0, matchLimit - 1)
+        + RECAP_AUTO_MAX_GAP_PAGES,
+    );
+    if (matchLimit < RECAP_AUTO_MIN_MATCH_PAGES || currentLimit < 1) return 0;
     const currentFingerprints = new Map();
     const previousFingerprints = new Map();
-    let matched = 0;
-    for (let count = 1; count <= limit; count++) {
+    const previousStart = previousImages.length - matchLimit;
+    for (let count = 1; count <= Math.max(currentLimit, matchLimit); count++) {
       const currentIndex = count - 1;
       const previousIndex = previousImages.length - count;
-      const [current, previous] = await Promise.all([
-        cachedRecapFingerprint(currentImages[currentIndex], {
+      const tasks = [];
+      if (currentIndex < currentLimit) {
+        tasks.push(cachedRecapFingerprint(currentImages[currentIndex], {
           photoId: state.photoId, scrambleId: state.scrambleId, speed: state.speed,
-        }),
-        cachedRecapFingerprint(previousImages[previousIndex], previousChapter),
-      ]);
-      currentFingerprints.set(currentIndex, current);
-      previousFingerprints.set(previousIndex, previous);
-      if (count < RECAP_AUTO_MIN_MATCH_PAGES) continue;
-      let same = true;
-      for (let index = 0; index < count; index++) {
-        const currentFingerprint = currentFingerprints.get(index);
-        const previousFingerprint = previousFingerprints.get(previousImages.length - count + index);
-        if (!currentFingerprint || currentFingerprint !== previousFingerprint) {
-          same = false;
-          break;
-        }
+        }).then((fingerprint) => currentFingerprints.set(currentIndex, fingerprint)));
       }
-      if (same) matched = count;
+      if (count <= matchLimit) {
+        tasks.push(cachedRecapFingerprint(previousImages[previousIndex], previousChapter)
+          .then((fingerprint) => previousFingerprints.set(previousIndex, fingerprint)));
+      }
+      await Promise.all(tasks);
     }
-    return matched;
+    const currentTokens = Array.from({ length: currentLimit }, (_, index) => (
+      currentFingerprints.get(index) || ''
+    ));
+    const previousTokens = Array.from({ length: matchLimit }, (_, index) => (
+      previousFingerprints.get(previousStart + index) || ''
+    ));
+    return detectRecapSequence(currentTokens, previousTokens);
   }
 
   async function detectRecapInBackground() {
