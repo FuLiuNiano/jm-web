@@ -16,6 +16,10 @@ const RAW_CACHE_DEFAULT_BYTES = 64 * MIB;
 const RAW_CACHE_MEMORY_OPT_BYTES = 32 * MIB;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+const RECAP_AUTO_MIN_MATCH_PAGES = 3;
+const RECAP_FINGERPRINT_PAGE_LIMIT = 8;
+const RECAP_FINGERPRINT_MAX_BYTES = 4 * MIB;
+const READER_IMAGE_AUTO_RETRIES = 3;
 
 /**
  * 计算原图 Blob 缓存预算。按设备内存自适应，且在“内存优化”开启时
@@ -96,18 +100,21 @@ function imageIdentity(value) {
 }
 
 /**
- * 通过“上一话末尾页 = 本话开头页”识别重复回顾。至少连续重复两页才自动跳过，
- * 以免把恰好相同的封面或章节扉页误判成回顾；识别失败时返回 0，保留原页面。
+ * 通过“上一话末尾页 = 本话开头页”识别重复回顾。自动识别默认要求至少连续
+ * 3 页，单张/两张通用封面不会再被当成回顾；手动设置仍可指定 1、2 页。
  */
-export function detectRecapPageCount(currentImages, previousImages, maxPages = 12) {
+export function detectRecapPageCount(
+  currentImages, previousImages, maxPages = 12, minPages = RECAP_AUTO_MIN_MATCH_PAGES,
+) {
   if (!Array.isArray(currentImages) || !Array.isArray(previousImages)
       || currentImages.length < 2 || !previousImages.length) return 0;
+  const minimum = Math.max(1, Math.min(20, Math.trunc(Number(minPages) || RECAP_AUTO_MIN_MATCH_PAGES)));
   const limit = Math.min(
     Math.max(0, Math.trunc(Number(maxPages) || 12)),
     currentImages.length - 1,
     previousImages.length,
   );
-  for (let count = limit; count >= 2; count--) {
+  for (let count = limit; count >= minimum; count--) {
     const previousStart = previousImages.length - count;
     let same = true;
     for (let index = 0; index < count; index++) {
@@ -121,6 +128,51 @@ export function detectRecapPageCount(currentImages, previousImages, maxPages = 1
     if (same) return count;
   }
   return 0;
+}
+
+function fingerprintBytes(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (!bytes.length) return '';
+  let hashA = 2166136261;
+  let hashB = 16777619;
+  const stride = Math.max(1, Math.ceil(bytes.length / (1024 * 1024)));
+  for (let index = 0; index < bytes.length; index += stride) {
+    hashA ^= bytes[index];
+    hashA = Math.imul(hashA, 16777619);
+    hashB ^= bytes[index] + (index & 255);
+    hashB = Math.imul(hashB, 2166136261);
+  }
+  return `${bytes.length}:${hashA >>> 0}:${hashB >>> 0}`;
+}
+
+async function fingerprintImage(item, signal) {
+  const source = typeof item?.url === 'string' ? item.url.trim() : '';
+  if (!source) return '';
+  const requestUrl = chapterImgSrc(source);
+  if (!requestUrl) return '';
+  try {
+    const response = await fetch(requestUrl, {
+      headers: { 'X-JMW-Data-Source': selectedDataSource() },
+      credentials: 'same-origin',
+      cache: 'default',
+      priority: 'low',
+      signal,
+    });
+    if (!response.ok) return '';
+    const declared = Number(response.headers?.get('content-length'));
+    if (Number.isFinite(declared) && declared > RECAP_FINGERPRINT_MAX_BYTES) return '';
+    const body = await response.arrayBuffer();
+    if (!body.byteLength || body.byteLength > RECAP_FINGERPRINT_MAX_BYTES) return '';
+    const subtle = globalThis.crypto?.subtle;
+    if (subtle) {
+      const digest = new Uint8Array(await subtle.digest('SHA-256', body));
+      return `${body.byteLength}:${Array.from(digest, (value) => value.toString(16).padStart(2, '0')).join('')}`;
+    }
+    return fingerprintBytes(body);
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    return '';
+  }
 }
 
 export function normalizeChapterImages(value) {
@@ -302,6 +354,8 @@ export function mountReader(root, photoId, query, options = {}) {
   let explicitStartPending = requestedPage != null;
   const deviceMemory = typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined;
   let recapDetectionSeq = 0;
+  const recapFingerprintCache = new Map();
+  const imageRetryAttempts = new Map();
   let continuousPrefetchSeq = 0;
   let continuousPrefetchRunning = false;
   let continuousPrefetchNext = 0;
@@ -345,6 +399,7 @@ export function mountReader(root, photoId, query, options = {}) {
   function setSourceImages(images) {
     const previousImage = state.images[state.cur];
     state.sourceImages = Array.isArray(images) ? images : [];
+    imageRetryAttempts.clear();
     state.recapSkipPages = Math.min(
       configuredRecapSkipPages(),
       Math.max(0, state.sourceImages.length - 1),
@@ -413,6 +468,54 @@ export function mountReader(root, photoId, query, options = {}) {
     return Array.isArray(rows) ? rows.slice().sort((a, b) => Number(a?.index) - Number(b?.index)) : [];
   }
 
+  async function cachedRecapFingerprint(image) {
+    const key = typeof image?.url === 'string' ? image.url : '';
+    if (!key) return '';
+    if (recapFingerprintCache.has(key)) return recapFingerprintCache.get(key);
+    const fingerprint = await fingerprintImage(image, signal);
+    if (fingerprint) {
+      recapFingerprintCache.set(key, fingerprint);
+      while (recapFingerprintCache.size > 48) {
+        recapFingerprintCache.delete(recapFingerprintCache.keys().next().value);
+      }
+    }
+    return fingerprint;
+  }
+
+  /**
+   * URL 可能因章节 ID、CDN 或签名参数不同而变化，因此在 URL 匹配失败后，
+   * 仅在后台对两端最多 8 页做内容指纹比对。它不阻塞首图，也不会把图片
+   * 常驻内存；只缓存短字符串指纹。
+   */
+  async function detectRecapPageCountByContent(currentImages, previousImages) {
+    const limit = Math.min(
+      RECAP_FINGERPRINT_PAGE_LIMIT,
+      currentImages.length - 1,
+      previousImages.length,
+    );
+    if (limit < RECAP_AUTO_MIN_MATCH_PAGES) return 0;
+    const currentHead = currentImages.slice(0, limit);
+    const previousTail = previousImages.slice(-limit);
+    const [currentFingerprints, previousFingerprints] = await Promise.all([
+      Promise.all(currentHead.map((image) => cachedRecapFingerprint(image))),
+      Promise.all(previousTail.map((image) => cachedRecapFingerprint(image))),
+    ]);
+    for (let count = limit; count >= RECAP_AUTO_MIN_MATCH_PAGES; count--) {
+      const previousStart = limit - count;
+      let same = true;
+      for (let index = 0; index < count; index++) {
+        const current = currentFingerprints[index];
+        const previous = previousFingerprints[previousStart + index];
+        if (!current || current !== previous) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return count;
+    }
+    return 0;
+  }
+
   async function detectRecapInBackground() {
     if (state.destroyed || signal.aborted || !recapMasterEnabled() || setting.readerRecapAutoEnabled === false
         || storedRecapSkipPages() > 0 || state.curChapterIdx <= 0 || !state.sourceImages.length) return;
@@ -423,7 +526,8 @@ export function mountReader(root, photoId, query, options = {}) {
       const images = await previousChapterImages(previous);
       if (state.destroyed || signal.aborted || seq !== recapDetectionSeq || !recapMasterEnabled()
           || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
-      const pages = detectRecapPageCount(state.sourceImages, images);
+      const pages = detectRecapPageCount(state.sourceImages, images)
+        || await detectRecapPageCountByContent(state.sourceImages, images);
       if (!pages || pages === state.recapAutoSkipPages) return;
       const oldPages = state.recapSkipPages;
       state.recapAutoSkipPages = pages;
@@ -742,6 +846,7 @@ export function mountReader(root, photoId, query, options = {}) {
       total: state.images.length,
       recapAvailable: state.sourceImages.length > 1,
       readerRecapMasterEnabled: recapMasterEnabled(),
+      readerRecapAutoEnabled: setting.readerRecapAutoEnabled !== false,
       recapSkipEnabled: state.recapSkipPages > 0,
       recapSkipPages: state.recapSkipPages || 1,
       hasPreviousChapter: state.curChapterIdx > 0,
@@ -778,6 +883,20 @@ export function mountReader(root, photoId, query, options = {}) {
         render();
         if (value === true) detectRecapInBackground();
         showHint(value ? '已开启片头回顾跳过' : '已关闭片头回顾跳过');
+      }
+      applyReaderSettings();
+      return;
+    }
+    if (key === 'readerRecapAutoEnabled') {
+      value = value === true;
+      const previous = setting.readerRecapAutoEnabled !== false;
+      updateSetting({ readerRecapAutoEnabled: value });
+      if (previous !== value && state.sourceImages.length) {
+        setSourceImages(state.sourceImages);
+        resetDecodedAfterImageListChange();
+        render();
+        if (value === true) detectRecapInBackground();
+        showHint(value ? '已开启自动识别重复回顾' : '已关闭自动识别，请使用手动页数');
       }
       applyReaderSettings();
       return;
@@ -1374,8 +1493,29 @@ export function mountReader(root, photoId, query, options = {}) {
     });
   }
 
+  function retryImageSource(source, attempt) {
+    const base = chapterImgSrc(source);
+    if (!base || !attempt) return base;
+    try {
+      const pageUrl = new URL(base, typeof location !== 'undefined' ? location.href : 'https://jmw.invalid/');
+      const upstream = pageUrl.searchParams.get('u');
+      if (upstream) {
+        const upstreamUrl = new URL(upstream);
+        // 给上游 URL 加 nonce，绕过代理中可能已经留下的损坏响应缓存。
+        upstreamUrl.searchParams.set('_jmw_retry', String(attempt));
+        pageUrl.searchParams.set('u', upstreamUrl.href);
+      } else {
+        pageUrl.searchParams.set('_jmw_retry', String(attempt));
+      }
+      return `${pageUrl.pathname}${pageUrl.search}`;
+    } catch (_) {
+      return base;
+    }
+  }
+
   function srcOf(idx) {
-    return chapterImgSrc(state.images[idx].url);
+    const attempt = Number(imageRetryAttempts.get(idx) || 0);
+    return retryImageSource(state.images[idx].url, attempt);
   }
 
   function primeDirectImage(idx, url) {
@@ -1657,7 +1797,8 @@ export function mountReader(root, photoId, query, options = {}) {
       return rec;
     } catch (e) {
       if (!state.destroyed && !signal.aborted && !imageSignal.aborted
-          && generation === imageGeneration && e.name !== 'AbortError') markError(idx, e.message);
+          && generation === imageGeneration && e.name !== 'AbortError'
+          && !scheduleReaderImageRetry(idx)) markError(idx, e.message);
       return null;
     } finally {
       if (acquired) activeDecodes--;
@@ -1690,6 +1831,43 @@ export function mountReader(root, photoId, query, options = {}) {
       memoryOptimized: setting.readMemoryOptEnabled === true,
       configured: setting.readDecodeConcurrency,
     });
+  }
+
+  function scheduleReaderImageRetry(idx) {
+    if (offline || state.destroyed || signal.aborted) return false;
+    // 后台邻页失败不反复抢占带宽；当前页和首图失败时自动恢复，其他页
+    // 仍保留原来的“重试”按钮。
+    if (idx !== state.cur && idx !== 0) return false;
+    const attempts = Number(imageRetryAttempts.get(idx) || 0);
+    if (attempts >= READER_IMAGE_AUTO_RETRIES) return false;
+    const nextAttempt = attempts + 1;
+    imageRetryAttempts.set(idx, nextAttempt);
+    const record = state.decoded.get(idx);
+    if (record) {
+      revokeReaderObjectUrl(record.url);
+      state.decoded.delete(idx);
+    }
+    dropRaw(idx);
+    state.dims.delete(idx);
+    const slot = pages.querySelector(`.slot[data-idx="${idx}"]`);
+    if (slot) {
+      slot.dataset.mounted = '0';
+      delete slot.dataset.generation;
+      delete slot.dataset.objectUrl;
+      clearReservedHeight(slot);
+      slot.replaceChildren(placeholderFor(idx));
+    }
+    if (idx === state.cur) showHint(`第 ${idx + 1} 页加载失败，正在自动重试…`);
+    const delay = 260 * (2 ** (nextAttempt - 1));
+    setTimeout(() => {
+      if (state.destroyed || signal.aborted || !state.images[idx]) return;
+      ensureDecoded(idx).then((nextRecord) => {
+        if (!nextRecord || state.destroyed) return;
+        const currentSlot = pages.querySelector(`.slot[data-idx="${idx}"]`);
+        if (currentSlot && currentSlot.dataset.idx === String(idx)) mountSlot(idx);
+      });
+    }, delay);
+    return true;
   }
 
   function markError(idx, msg) {
@@ -1788,6 +1966,7 @@ export function mountReader(root, photoId, query, options = {}) {
         ? { width: String(knownWidth), height: String(knownHeight) }
         : {}),
       onload: () => {
+        imageRetryAttempts.delete(idx);
         const beforeResize = captureScrollAnchor();
         backfillReaderImageDimensions({
           image, slot, index: idx, record: rec, state,
@@ -1803,6 +1982,7 @@ export function mountReader(root, photoId, query, options = {}) {
         // 只处理仍属于当前槽位的记录，避免快速翻页后的迟到 error 污染新页。
         if (state.destroyed || !slot.isConnected || slot.dataset.idx !== String(idx)
             || state.decoded.get(idx) !== rec) return;
+        if (scheduleReaderImageRetry(idx)) return;
         revokeReaderObjectUrl(rec.url);
         state.decoded.delete(idx);
         dropRaw(idx);

@@ -102,6 +102,12 @@ export function createReaderSettings(options) {
   recapMaster.addEventListener('change', () => options.onSetting(
     'readerRecapMasterEnabled', recapMaster.checked,
   ));
+  const recapAuto = h('input', {
+    type: 'checkbox', class: 'r-switch', 'aria-label': '自动识别重复回顾',
+  });
+  recapAuto.addEventListener('change', () => options.onSetting(
+    'readerRecapAutoEnabled', recapAuto.checked,
+  ));
   const recapPages = h('select', { class: 'r-setting-select', 'aria-label': '跳过开头回顾页数' },
     ...[1, 2, 3, 4, 5, 8, 10, 12].map((value) => h('option', { value: String(value) }, `${value} 页`)),
   );
@@ -238,7 +244,8 @@ export function createReaderSettings(options) {
           prefetchSelect,
         ),
         switchRow('跳过片头回顾总开关', '关闭后自动和手动跳过都不生效，原来的手动设置会保留', recapMaster),
-        switchRow('跳过开头回顾', '自动比对上一话末尾页面；识别不到时可手动指定', recapSkip),
+        switchRow('自动识别重复回顾', '至少连续 3 页内容一致才自动跳过；封面重复时可关闭', recapAuto),
+        switchRow('跳过开头回顾', '手动指定回顾页数；关闭自动识别后仍可使用', recapSkip),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
             h('span', { class: 'r-setting-label' }, '回顾页数'),
@@ -286,8 +293,10 @@ export function createReaderSettings(options) {
       ? String(s.prefetchCount) : '3';
     recapSkip.checked = s.recapSkipEnabled === true;
     recapMaster.checked = s.readerRecapMasterEnabled !== false;
+    recapAuto.checked = s.readerRecapAutoEnabled !== false;
     recapMaster.disabled = s.recapAvailable === false;
     recapSkip.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
+    recapAuto.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12'].includes(String(s.recapSkipPages))
       ? String(s.recapSkipPages) : '1';
     recapPages.disabled = !recapSkip.checked || s.readerRecapMasterEnabled === false || s.recapAvailable === false;
