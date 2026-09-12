@@ -188,7 +188,7 @@ function jsonResponse(body, status = 200) {
 
   assert.deepStrictEqual(normalizeReaderSeries({}), []);
   assert.deepStrictEqual(normalizeReaderSeries([
-    null, { id: 'bad' }, { id: 101, name: ' 第一章 ', sort: 2 }, { id: '102', name: '' },
+    null, { id: 'bad' }, { id: 101, name: ' 第一章 ', sort: 2 }, { photo_id: '102', title: '' },
   ]), [
     { id: '101', name: '第一章', sort: 2 },
     { id: '102', name: '', sort: 1 },

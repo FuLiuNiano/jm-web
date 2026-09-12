@@ -85,6 +85,21 @@ function deferred() {
   ), 4, '回顾中间插入一张封面时仍应跳过完整回顾段');
   assert.strictEqual(detectRecapPageCount(
     [
+      { url: 'https://cdn-a.example/page-a.jpg' },
+      { url: 'https://cdn-a.example/page-b.jpg' },
+      { url: 'https://cdn-a.example/page-c.jpg' },
+      { url: 'https://cdn-a.example/new.jpg' },
+    ],
+    [
+      { url: 'https://cdn-b.example/old.jpg' },
+      { url: 'https://cdn-b.example/page-a.jpg' },
+      { url: 'https://cdn-b.example/page-b.jpg' },
+      { url: 'https://cdn-b.example/page-c.jpg' },
+      { url: 'https://cdn-b.example/ending-cover.jpg' },
+    ],
+  ), 3, '上一话末尾追加封面时仍应识别前面的回顾内容');
+  assert.strictEqual(detectRecapPageCount(
+    [
       { url: 'https://cdn-a.example/cover-before.jpg' },
       { url: 'https://cdn-a.example/page-a.jpg' },
       { url: 'https://cdn-a.example/cover-between-a-b.jpg' },
