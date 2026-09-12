@@ -17,7 +17,7 @@ const RAW_CACHE_MEMORY_OPT_BYTES = 32 * MIB;
 const READER_TUTORIAL_KEY = 'jmw_reader_tutorial_dismissed_v1';
 const SAFE_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 const RECAP_AUTO_MIN_MATCH_PAGES = 3;
-const RECAP_FINGERPRINT_PAGE_LIMIT = 8;
+const RECAP_FINGERPRINT_PAGE_LIMIT = 20;
 const RECAP_FINGERPRINT_MAX_BYTES = 4 * MIB;
 const READER_IMAGE_AUTO_RETRIES = 3;
 
@@ -484,8 +484,8 @@ export function mountReader(root, photoId, query, options = {}) {
 
   /**
    * URL 可能因章节 ID、CDN 或签名参数不同而变化，因此在 URL 匹配失败后，
-   * 仅在后台对两端最多 8 页做内容指纹比对。它不阻塞首图，也不会把图片
-   * 常驻内存；只缓存短字符串指纹。
+   * 在后台逐层扩展两端的内容指纹比对，最多支持 20 页。每轮最多请求两张
+   * 图片，不阻塞首图，也不会把图片常驻内存；只缓存短字符串指纹。
    */
   async function detectRecapPageCountByContent(currentImages, previousImages) {
     const limit = Math.min(
@@ -494,26 +494,31 @@ export function mountReader(root, photoId, query, options = {}) {
       previousImages.length,
     );
     if (limit < RECAP_AUTO_MIN_MATCH_PAGES) return 0;
-    const currentHead = currentImages.slice(0, limit);
-    const previousTail = previousImages.slice(-limit);
-    const [currentFingerprints, previousFingerprints] = await Promise.all([
-      Promise.all(currentHead.map((image) => cachedRecapFingerprint(image))),
-      Promise.all(previousTail.map((image) => cachedRecapFingerprint(image))),
-    ]);
-    for (let count = limit; count >= RECAP_AUTO_MIN_MATCH_PAGES; count--) {
-      const previousStart = limit - count;
+    const currentFingerprints = new Map();
+    const previousFingerprints = new Map();
+    let matched = 0;
+    for (let count = 1; count <= limit; count++) {
+      const currentIndex = count - 1;
+      const previousIndex = previousImages.length - count;
+      const [current, previous] = await Promise.all([
+        cachedRecapFingerprint(currentImages[currentIndex]),
+        cachedRecapFingerprint(previousImages[previousIndex]),
+      ]);
+      currentFingerprints.set(currentIndex, current);
+      previousFingerprints.set(previousIndex, previous);
+      if (count < RECAP_AUTO_MIN_MATCH_PAGES) continue;
       let same = true;
       for (let index = 0; index < count; index++) {
-        const current = currentFingerprints[index];
-        const previous = previousFingerprints[previousStart + index];
-        if (!current || current !== previous) {
+        const currentFingerprint = currentFingerprints.get(index);
+        const previousFingerprint = previousFingerprints.get(previousImages.length - count + index);
+        if (!currentFingerprint || currentFingerprint !== previousFingerprint) {
           same = false;
           break;
         }
       }
-      if (same) return count;
+      if (same) matched = count;
     }
-    return 0;
+    return matched;
   }
 
   async function detectRecapInBackground() {
@@ -526,7 +531,7 @@ export function mountReader(root, photoId, query, options = {}) {
       const images = await previousChapterImages(previous);
       if (state.destroyed || signal.aborted || seq !== recapDetectionSeq || !recapMasterEnabled()
           || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
-      const pages = detectRecapPageCount(state.sourceImages, images)
+      const pages = detectRecapPageCount(state.sourceImages, images, RECAP_FINGERPRINT_PAGE_LIMIT)
         || await detectRecapPageCountByContent(state.sourceImages, images);
       if (!pages || pages === state.recapAutoSkipPages) return;
       const oldPages = state.recapSkipPages;

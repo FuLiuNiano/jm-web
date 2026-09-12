@@ -109,7 +109,7 @@ export function createReaderSettings(options) {
     'readerRecapAutoEnabled', recapAuto.checked,
   ));
   const recapPages = h('select', { class: 'r-setting-select', 'aria-label': '跳过开头回顾页数' },
-    ...[1, 2, 3, 4, 5, 8, 10, 12].map((value) => h('option', { value: String(value) }, `${value} 页`)),
+    ...[1, 2, 3, 4, 5, 8, 10, 12, 15, 20].map((value) => h('option', { value: String(value) }, `${value} 页`)),
   );
   recapPages.addEventListener('change', () => options.onSetting('recapSkipPages', Number(recapPages.value)));
 
@@ -297,7 +297,7 @@ export function createReaderSettings(options) {
     recapMaster.disabled = s.recapAvailable === false;
     recapSkip.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     recapAuto.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
-    recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12'].includes(String(s.recapSkipPages))
+    recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12', '15', '20'].includes(String(s.recapSkipPages))
       ? String(s.recapSkipPages) : '1';
     recapPages.disabled = !recapSkip.checked || s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     followBrightness.checked = s.brightnessFollowSystem !== false;
