@@ -1434,7 +1434,7 @@ export function mountReader(root, photoId, query, options = {}) {
       }
       return;
     }
-    const albumPromise = state.aid
+    let albumPromise = state.aid
       ? readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null)
       : Promise.resolve(null);
     // 与章节/详情并行读取能力配置；翻译关闭时阅读器不应逐页发送 503 探测请求。
@@ -1460,6 +1460,12 @@ export function mountReader(root, photoId, query, options = {}) {
     if (state.destroyed) return;
     const d = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
       ? data.data : {};
+    // 直链、历史记录或外部分享有时没有带 aid；章节 HTML 自带的 aid 仍可
+    // 用于补齐作品目录，否则阅读器无法定位上一话，自动回顾识别不会触发。
+    if (!state.aid && /^\d{1,16}$/.test(String(d.aid || ''))) {
+      state.aid = String(d.aid);
+      albumPromise = readerRequest(`/album?id=${encodeURIComponent(state.aid)}`).catch(() => null);
+    }
     setSourceImages(normalizeChapterImages(d.images));
     if (!state.images.length) {
       showFatal('章节没有返回可读取的安全图片，请稍后重试或切换线路');
