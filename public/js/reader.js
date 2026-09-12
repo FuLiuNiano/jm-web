@@ -331,7 +331,12 @@ export function mountReader(root, photoId, query, options = {}) {
     return normalizeRecapSkipPages(map[recapSettingKey()]);
   }
 
+  function recapMasterEnabled() {
+    return setting.readerRecapMasterEnabled !== false;
+  }
+
   function configuredRecapSkipPages() {
+    if (!recapMasterEnabled()) return 0;
     const manual = storedRecapSkipPages();
     if (manual > 0) return manual;
     return setting.readerRecapAutoEnabled !== false ? state.recapAutoSkipPages : 0;
@@ -409,14 +414,14 @@ export function mountReader(root, photoId, query, options = {}) {
   }
 
   async function detectRecapInBackground() {
-    if (state.destroyed || signal.aborted || setting.readerRecapAutoEnabled === false
+    if (state.destroyed || signal.aborted || !recapMasterEnabled() || setting.readerRecapAutoEnabled === false
         || storedRecapSkipPages() > 0 || state.curChapterIdx <= 0 || !state.sourceImages.length) return;
     const previous = state.chapters[state.curChapterIdx - 1];
     if (!previous?.id) return;
     const seq = ++recapDetectionSeq;
     try {
       const images = await previousChapterImages(previous);
-      if (state.destroyed || signal.aborted || seq !== recapDetectionSeq
+      if (state.destroyed || signal.aborted || seq !== recapDetectionSeq || !recapMasterEnabled()
           || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
       const pages = detectRecapPageCount(state.sourceImages, images);
       if (!pages || pages === state.recapAutoSkipPages) return;
@@ -736,6 +741,7 @@ export function mountReader(root, photoId, query, options = {}) {
       current: state.cur,
       total: state.images.length,
       recapAvailable: state.sourceImages.length > 1,
+      readerRecapMasterEnabled: recapMasterEnabled(),
       recapSkipEnabled: state.recapSkipPages > 0,
       recapSkipPages: state.recapSkipPages || 1,
       hasPreviousChapter: state.curChapterIdx > 0,
@@ -762,6 +768,20 @@ export function mountReader(root, photoId, query, options = {}) {
 
   function changeReaderSetting(key, value) {
     if (state.destroyed) return;
+    if (key === 'readerRecapMasterEnabled') {
+      value = value === true;
+      const previous = recapMasterEnabled();
+      updateSetting({ readerRecapMasterEnabled: value });
+      if (previous !== value && state.sourceImages.length) {
+        setSourceImages(state.sourceImages);
+        resetDecodedAfterImageListChange();
+        render();
+        if (value === true) detectRecapInBackground();
+        showHint(value ? '已开启片头回顾跳过' : '已关闭片头回顾跳过');
+      }
+      applyReaderSettings();
+      return;
+    }
     if (key === 'recapSkipEnabled' || key === 'recapSkipPages') {
       const previous = state.recapSkipPages;
       let pages = key === 'recapSkipPages' ? normalizeRecapSkipPages(value) : previous || 1;

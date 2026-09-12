@@ -96,6 +96,12 @@ export function createReaderSettings(options) {
     type: 'checkbox', class: 'r-switch', 'aria-label': '跳过开头回顾',
   });
   recapSkip.addEventListener('change', () => options.onSetting('recapSkipEnabled', recapSkip.checked));
+  const recapMaster = h('input', {
+    type: 'checkbox', class: 'r-switch', 'aria-label': '跳过片头回顾总开关',
+  });
+  recapMaster.addEventListener('change', () => options.onSetting(
+    'readerRecapMasterEnabled', recapMaster.checked,
+  ));
   const recapPages = h('select', { class: 'r-setting-select', 'aria-label': '跳过开头回顾页数' },
     ...[1, 2, 3, 4, 5, 8, 10, 12].map((value) => h('option', { value: String(value) }, `${value} 页`)),
   );
@@ -231,6 +237,7 @@ export function createReaderSettings(options) {
           ),
           prefetchSelect,
         ),
+        switchRow('跳过片头回顾总开关', '关闭后自动和手动跳过都不生效，原来的手动设置会保留', recapMaster),
         switchRow('跳过开头回顾', '自动比对上一话末尾页面；识别不到时可手动指定', recapSkip),
         h('label', { class: 'r-setting-row' },
           h('span', { class: 'r-setting-copy' },
@@ -278,10 +285,12 @@ export function createReaderSettings(options) {
     prefetchSelect.value = ['1', '2', '3', '5', '8'].includes(String(s.prefetchCount))
       ? String(s.prefetchCount) : '3';
     recapSkip.checked = s.recapSkipEnabled === true;
+    recapMaster.checked = s.readerRecapMasterEnabled !== false;
+    recapMaster.disabled = s.recapAvailable === false;
+    recapSkip.disabled = s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     recapPages.value = ['1', '2', '3', '4', '5', '8', '10', '12'].includes(String(s.recapSkipPages))
       ? String(s.recapSkipPages) : '1';
-    recapSkip.disabled = s.recapAvailable === false;
-    recapPages.disabled = !recapSkip.checked || s.recapAvailable === false;
+    recapPages.disabled = !recapSkip.checked || s.readerRecapMasterEnabled === false || s.recapAvailable === false;
     followBrightness.checked = s.brightnessFollowSystem !== false;
     brightness.value = String(Math.round(clamp(s.brightness ?? 1, .2, 1) * 100));
     brightness.disabled = followBrightness.checked;
