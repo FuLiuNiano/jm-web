@@ -130,22 +130,64 @@ export function detectRecapPageCount(
   return 0;
 }
 
-function fingerprintBytes(buffer) {
-  const bytes = new Uint8Array(buffer);
-  if (!bytes.length) return '';
-  let hashA = 2166136261;
-  let hashB = 16777619;
-  const stride = Math.max(1, Math.ceil(bytes.length / (1024 * 1024)));
-  for (let index = 0; index < bytes.length; index += stride) {
-    hashA ^= bytes[index];
-    hashA = Math.imul(hashA, 16777619);
-    hashB ^= bytes[index] + (index & 255);
-    hashB = Math.imul(hashB, 2166136261);
+async function imageBitmapFromBlob(blob) {
+  if (typeof createImageBitmap === 'function') {
+    try { return await createImageBitmap(blob); } catch (_) {}
   }
-  return `${bytes.length}:${hashA >>> 0}:${hashB >>> 0}`;
+  if (typeof Image === 'undefined' || typeof globalThis.URL?.createObjectURL !== 'function') return null;
+  const objectUrl = globalThis.URL.createObjectURL(blob);
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const element = new Image();
+      element.onload = () => resolve(element);
+      element.onerror = () => reject(new Error('图片视觉指纹解码失败'));
+      element.src = objectUrl;
+    });
+    image.close = () => globalThis.URL.revokeObjectURL(objectUrl);
+    return image;
+  } catch (_) {
+    globalThis.URL.revokeObjectURL(objectUrl);
+    return null;
+  }
 }
 
-async function fingerprintImage(item, signal) {
+async function visualFingerprint(blob) {
+  if (!(blob instanceof Blob) || !blob.size) return '';
+  const bitmap = await imageBitmapFromBlob(blob);
+  if (!bitmap || !bitmap.width || !bitmap.height) return '';
+  const width = 16;
+  const height = 24;
+  const canvas = typeof OffscreenCanvas === 'function'
+    ? new OffscreenCanvas(width, height) : document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) {
+    bitmap.close?.();
+    return '';
+  }
+  try {
+    context.drawImage(bitmap, 0, 0, width, height);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    const gray = [];
+    let total = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const value = Math.round(pixels[index] * .299 + pixels[index + 1] * .587 + pixels[index + 2] * .114);
+      gray.push(value);
+      total += value;
+    }
+    const average = total / gray.length;
+    // 384 个二值采样点足以区分连续回顾页，又对压缩/尺寸变化稳定。
+    return `${width}x${height}:${gray.map((value) => value >= average ? '1' : '0').join('')}`;
+  } catch (_) {
+    return '';
+  } finally {
+    bitmap.close?.();
+    try { canvas.width = 1; canvas.height = 1; } catch (_) {}
+  }
+}
+
+async function fingerprintImage(item, signal, chapterMeta = {}) {
   const source = typeof item?.url === 'string' ? item.url.trim() : '';
   if (!source) return '';
   const requestUrl = chapterImgSrc(source);
@@ -161,14 +203,17 @@ async function fingerprintImage(item, signal) {
     if (!response.ok) return '';
     const declared = Number(response.headers?.get('content-length'));
     if (Number.isFinite(declared) && declared > RECAP_FINGERPRINT_MAX_BYTES) return '';
-    const body = await response.arrayBuffer();
-    if (!body.byteLength || body.byteLength > RECAP_FINGERPRINT_MAX_BYTES) return '';
-    const subtle = globalThis.crypto?.subtle;
-    if (subtle) {
-      const digest = new Uint8Array(await subtle.digest('SHA-256', body));
-      return `${body.byteLength}:${Array.from(digest, (value) => value.toString(16).padStart(2, '0')).join('')}`;
-    }
-    return fingerprintBytes(body);
+    const rawBlob = await response.blob();
+    if (!rawBlob.size || rawBlob.size > RECAP_FINGERPRINT_MAX_BYTES) return '';
+    const scrambleId = Number(chapterMeta.scrambleId || 0);
+    const photoId = Number(chapterMeta.photoId || 0);
+    const speed = String(chapterMeta.speed || '');
+    const displayBlob = needsScramble({
+      photoId, scrambleId, speed, name: String(item.name || ''),
+    })
+      ? (await decodeFromBlob(rawBlob, photoId, item.page, { signal })).blob
+      : rawBlob;
+    return await visualFingerprint(displayBlob);
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
     return '';
@@ -457,24 +502,38 @@ export function mountReader(root, photoId, query, options = {}) {
   }
 
   async function previousChapterImages(chapter) {
-    if (!chapter?.id) return [];
+    if (!chapter?.id) return { images: [], photoId: '', scrambleId: 0, speed: '' };
     if (!offline) {
       const data = await readerRequest(`/chapter?id=${encodeURIComponent(chapter.id)}&shunt=${encodeURIComponent(activeImageShunt)}`);
       const payload = data && data.data && typeof data.data === 'object' && !Array.isArray(data.data)
         ? data.data : {};
-      return normalizeChapterImages(payload.images);
+      return {
+        images: normalizeChapterImages(payload.images),
+        photoId: String(chapter.id),
+        scrambleId: Number(payload.scrambleId || 0),
+        speed: String(payload.speed || ''),
+      };
     }
-    const rows = await listOfflineImages(state.aid, chapter.id, { includeBlob: false });
-    return Array.isArray(rows) ? rows.slice().sort((a, b) => Number(a?.index) - Number(b?.index)) : [];
+    const [rows, metadata] = await Promise.all([
+      listOfflineImages(state.aid, chapter.id, { includeBlob: false }),
+      getOfflineChapter(state.aid, chapter.id),
+    ]);
+    return {
+      images: Array.isArray(rows) ? rows.slice().sort((a, b) => Number(a?.index) - Number(b?.index)) : [],
+      photoId: String(chapter.id),
+      scrambleId: Number(metadata?.scrambleId || 0),
+      speed: String(metadata?.speed || ''),
+    };
   }
 
-  async function cachedRecapFingerprint(image) {
+  async function cachedRecapFingerprint(image, chapterMeta) {
     const key = typeof image?.url === 'string' ? image.url : '';
     if (!key) return '';
-    if (recapFingerprintCache.has(key)) return recapFingerprintCache.get(key);
-    const fingerprint = await fingerprintImage(image, signal);
+    const cacheKey = `${key}|${chapterMeta.photoId}|${chapterMeta.scrambleId}|${chapterMeta.speed}`;
+    if (recapFingerprintCache.has(cacheKey)) return recapFingerprintCache.get(cacheKey);
+    const fingerprint = await fingerprintImage(image, signal, chapterMeta);
     if (fingerprint) {
-      recapFingerprintCache.set(key, fingerprint);
+      recapFingerprintCache.set(cacheKey, fingerprint);
       while (recapFingerprintCache.size > 48) {
         recapFingerprintCache.delete(recapFingerprintCache.keys().next().value);
       }
@@ -487,7 +546,8 @@ export function mountReader(root, photoId, query, options = {}) {
    * 在后台逐层扩展两端的内容指纹比对，最多支持 20 页。每轮最多请求两张
    * 图片，不阻塞首图，也不会把图片常驻内存；只缓存短字符串指纹。
    */
-  async function detectRecapPageCountByContent(currentImages, previousImages) {
+  async function detectRecapPageCountByContent(currentImages, previousChapter) {
+    const previousImages = Array.isArray(previousChapter?.images) ? previousChapter.images : [];
     const limit = Math.min(
       RECAP_FINGERPRINT_PAGE_LIMIT,
       currentImages.length - 1,
@@ -501,8 +561,10 @@ export function mountReader(root, photoId, query, options = {}) {
       const currentIndex = count - 1;
       const previousIndex = previousImages.length - count;
       const [current, previous] = await Promise.all([
-        cachedRecapFingerprint(currentImages[currentIndex]),
-        cachedRecapFingerprint(previousImages[previousIndex]),
+        cachedRecapFingerprint(currentImages[currentIndex], {
+          photoId: state.photoId, scrambleId: state.scrambleId, speed: state.speed,
+        }),
+        cachedRecapFingerprint(previousImages[previousIndex], previousChapter),
       ]);
       currentFingerprints.set(currentIndex, current);
       previousFingerprints.set(previousIndex, previous);
@@ -528,11 +590,12 @@ export function mountReader(root, photoId, query, options = {}) {
     if (!previous?.id) return;
     const seq = ++recapDetectionSeq;
     try {
-      const images = await previousChapterImages(previous);
+      const previousChapterData = await previousChapterImages(previous);
+      const images = previousChapterData.images;
       if (state.destroyed || signal.aborted || seq !== recapDetectionSeq || !recapMasterEnabled()
           || setting.readerRecapAutoEnabled === false || storedRecapSkipPages() > 0) return;
       const pages = detectRecapPageCount(state.sourceImages, images, RECAP_FINGERPRINT_PAGE_LIMIT)
-        || await detectRecapPageCountByContent(state.sourceImages, images);
+        || await detectRecapPageCountByContent(state.sourceImages, previousChapterData);
       if (!pages || pages === state.recapAutoSkipPages) return;
       const oldPages = state.recapSkipPages;
       state.recapAutoSkipPages = pages;
